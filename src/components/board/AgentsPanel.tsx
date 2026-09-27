@@ -31,6 +31,14 @@ function timeAgo(iso: string | null): string {
   return `${Math.round(seconds / 86400)}d ago`;
 }
 
+function formatResetTime(iso: string): string {
+  const date = new Date(iso);
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return sameDay
+    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+}
+
 function CopyBlock({ label, text }: { label: string; text: string }) {
   return (
     <div>
@@ -98,14 +106,18 @@ function RunnerRow({ runner }: { runner: RunnerInfo }) {
   const deleteRunner = useDeleteRunner();
   const [confirming, setConfirming] = useState(false);
 
+  const paused = !!runner.pausedUntil;
+
   return (
     <div className="rounded-md border border-border/50 p-3">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span
-              className={`inline-block h-2 w-2 shrink-0 rounded-full ${runner.online ? "bg-green-500" : "bg-muted-foreground/40"}`}
-              title={runner.online ? "Online" : "Offline"}
+              className={`inline-block h-2 w-2 shrink-0 rounded-full ${
+                !runner.online ? "bg-muted-foreground/40" : paused ? "bg-amber-500" : "bg-green-500"
+              }`}
+              title={!runner.online ? "Offline" : paused ? "Out of Claude usage" : "Online"}
             />
             <span className="truncate text-sm font-medium">{runner.name}</span>
             {runner.owner && (
@@ -120,6 +132,12 @@ function RunnerRow({ runner }: { runner: RunnerInfo }) {
               </span>
             )}
           </div>
+          {runner.online && paused && (
+            <div className="mt-1 text-xs text-amber-400">
+              Out of Claude usage until {formatResetTime(runner.pausedUntil!)}. Its tasks go to
+              other agents meanwhile.
+            </div>
+          )}
           <div className="mt-1 text-xs text-muted-foreground">
             {runner.online ? "Online" : `Last seen ${timeAgo(runner.lastSeenAt)}`}
             {runner.platform && ` · ${runner.platform}`}

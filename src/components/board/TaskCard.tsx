@@ -100,7 +100,7 @@ export function TaskCard({ task }: TaskCardProps) {
             <Badge
               variant="outline"
               className="text-[10px] border-blue-500/30 bg-blue-500/10 text-blue-400"
-              title="An earlier attempt ran out of turns; the next one continues from its progress"
+              title="An earlier attempt stopped before finishing (out of turns or usage); the next one continues from its progress"
             >
               Saved progress
             </Badge>

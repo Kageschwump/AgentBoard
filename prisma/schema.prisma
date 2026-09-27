@@ -82,6 +82,7 @@ model Runner {
   version     String    @default("")
   platform    String    @default("")
   concurrency Int       @default(1) // as reported by the runner
+  pausedUntil DateTime? // set while the runner waits out its owner's Claude usage limit
   createdAt   DateTime  @default(now())
 
   tasks Task[]

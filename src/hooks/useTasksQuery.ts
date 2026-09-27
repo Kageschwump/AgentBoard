@@ -346,6 +346,7 @@ export interface RunnerInfo {
   createdAt: string;
   online: boolean;
   outdated: boolean;
+  pausedUntil: string | null;
   activeTasks: { id: string; title: string }[];
 }
 

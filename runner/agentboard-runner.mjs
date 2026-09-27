@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const POLL_INTERVAL_MS = 5_000;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const LOG_FLUSH_INTERVAL_MS = 1_000;
@@ -447,13 +447,13 @@ async function commitAndPush(ws, message, log) {
   return diff;
 }
 
-/** Save an out-of-turns attempt's work so the next attempt can pick it up */
-async function saveCheckpoint(claim, ws, job, log) {
+/** Save an attempt's work when it stops early, so the next attempt can pick it up */
+async function saveCheckpoint(claim, ws, job, log, reason) {
   const checkpoint = { branchName: "", note: (job.lastText || "").slice(-2000), diff: "" };
   if (!ws.repo) return checkpoint;
   try {
     log("system", "Saving progress for the next attempt");
-    const diff = await commitAndPush(ws, `[AgentBoard] WIP: ${claim.task.title} (ran out of turns)`, log);
+    const diff = await commitAndPush(ws, `[AgentBoard] WIP: ${claim.task.title} (${reason})`, log);
     if (diff !== null) Object.assign(checkpoint, { branchName: ws.branchName, diff });
   } catch (err) {
     log("system", `Could not save progress: ${err.message}`);
@@ -501,6 +501,45 @@ async function cleanupWorkspace(ws, log) {
 
 // ── Claude ─────────────────────────────────────────────────────────
 
+// How Claude Code reports that its owner's usage (subscription limit / API rate limit) ran out
+const USAGE_LIMIT_PATTERN =
+  /usage limit|limit reached|hit your (?:usage )?limit|out of (?:extra )?usage|rate_limit_error|API Error: 429/i;
+// Stricter version for assistant text, so an agent merely discussing limits doesn't match
+const USAGE_LIMIT_MESSAGE = /usage limit reached|hit your (?:usage )?limit/i;
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/**
+ * When does the limit reset? Understands "...limit reached|1759012345",
+ * "resets 3pm", "resets at 11:30pm", "resets 23:00" and "resets Oct 3, 9am"
+ * (in this machine's timezone). Returns null if it can't tell.
+ */
+function parseResetTime(text, now = new Date()) {
+  const epoch = text.match(/\|(\d{10})\b/);
+  if (epoch) return new Date(Number(epoch[1]) * 1000);
+
+  const m = text.match(
+    /resets?\s+(?:at\s+|on\s+)?(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s*(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i
+  );
+  if (!m) return null;
+  const [, month, day, hourText, minuteText, meridiem] = m;
+  let hour = Number(hourText);
+  if (meridiem) hour = (hour % 12) + (meridiem.toLowerCase() === "pm" ? 12 : 0);
+  if (hour > 23) return null;
+
+  const reset = new Date(now);
+  reset.setHours(hour, Number(minuteText ?? 0), 0, 0);
+  if (month) {
+    const monthIndex = MONTHS.indexOf(month.toLowerCase());
+    if (monthIndex < 0) return null;
+    reset.setMonth(monthIndex, Number(day));
+    if (reset < now) reset.setFullYear(reset.getFullYear() + 1);
+  } else if (reset <= now) {
+    reset.setDate(reset.getDate() + 1);
+  }
+  return reset;
+}
+
 function buildPrompt(claim, ws) {
   let prompt = `You are an autonomous AI agent. Complete the following task without asking questions.
 Work in the current directory: ${ws.dir}`;
@@ -528,8 +567,8 @@ function resumeInstructions(claim, ws) {
       : "";
   }
 
-  // An earlier attempt ran out of turns
-  let text = `\n\n## Continuing earlier work\nA previous attempt at this task ran out of turns before finishing.`;
+  // An earlier attempt stopped before finishing (out of turns or usage)
+  let text = `\n\n## Continuing earlier work\nA previous attempt at this task stopped before finishing.`;
   if (ws.resumed) {
     text += ` Its work so far is already on this branch.${reviewHint()} Then carry on from where it stopped instead of starting over.`;
   } else if (!ws.repo) {
@@ -590,6 +629,11 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
     let buffered = "";
     // Fallback usage if the run dies before its final result message
     const seenMessages = new Map();
+    // Non-JSON output, where Claude Code reports things like usage limits
+    let rawOutput = "";
+    const keepRaw = (text) => {
+      rawOutput = (rawOutput + "\n" + text).slice(-4000);
+    };
 
     const handleLine = (line) => {
       if (!line.trim()) return;
@@ -598,6 +642,7 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
         msg = JSON.parse(line);
       } catch {
         log("stdout", line);
+        keepRaw(line);
         return;
       }
       if (msg.type === "assistant" && msg.message?.content) {
@@ -605,7 +650,8 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
           if (block.type === "text" && block.text) {
             log("stdout", block.text);
             job.transcript.push(block.text);
-            job.lastText = block.text;
+            // Remembered for checkpoints; Claude Code's own limit notice isn't useful there
+            if (!USAGE_LIMIT_MESSAGE.test(block.text)) job.lastText = block.text;
           } else if (block.type === "tool_use") {
             const text = `[Tool: ${block.name}] ${JSON.stringify(block.input).slice(0, 200)}`;
             log("stdout", text);
@@ -630,7 +676,10 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
     });
     child.stderr.on("data", (data) => {
       const text = data.toString().trim();
-      if (text) log("stderr", text);
+      if (text) {
+        log("stderr", text);
+        keepRaw(text);
+      }
     });
     child.on("error", (err) => {
       spawnError = err;
@@ -650,9 +699,28 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
       else if (result?.is_error) error = `Agent reported an error: ${String(result.result || result.subtype).slice(0, 500)}`;
       else if (code !== 0) error = `Claude exited with code ${code}`;
 
+      const outOfTurns = result?.subtype === "error_max_turns";
+
+      // Out of Claude usage? Only checked when the run failed for another reason
+      // than turns, so an agent merely talking about rate limits doesn't trigger it.
+      let usageLimit = null;
+      if (error && !spawnError && !outOfTurns) {
+        const fromCli = [result?.result, rawOutput].filter(Boolean).join("\n");
+        const lastAssistant = job.transcript.at(-1) ?? "";
+        if (USAGE_LIMIT_PATTERN.test(fromCli) || USAGE_LIMIT_MESSAGE.test(lastAssistant)) {
+          const text = `${fromCli}\n${lastAssistant}`;
+          const resetAt = parseResetTime(text);
+          usageLimit = {
+            resetAt: resetAt && !isNaN(resetAt.getTime()) ? resetAt : null,
+            message: (fromCli || lastAssistant).trim().split("\n")[0].slice(0, 300),
+          };
+        }
+      }
+
       resolve({
         error,
-        outOfTurns: result?.subtype === "error_max_turns",
+        outOfTurns,
+        usageLimit,
         usage,
         resultText: result?.result ?? "",
       });
@@ -710,6 +778,66 @@ ${transcript}`;
 const jobs = new Map();
 let me = { name: "runner" };
 let shuttingDown = false;
+
+// ── Usage limits ───────────────────────────────────────────────────
+
+const MIN_PAUSE_MS = 60_000;
+const FALLBACK_PAUSE_MS = 30 * 60_000; // when Claude doesn't say when the limit resets
+const MAX_PAUSE_MS = 8 * 24 * 60 * 60_000;
+const PAUSED_CHECK_IN_MS = 15_000;
+let pausedUntil = 0;
+
+function formatTime(ms) {
+  const date = new Date(ms);
+  return date.toDateString() === new Date().toDateString()
+    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+/** Stop taking tasks until the owner's Claude usage resets */
+function pauseForUsageLimit(resetAt) {
+  const now = Date.now();
+  let until = resetAt ? resetAt.getTime() + 30_000 : now + FALLBACK_PAUSE_MS;
+  until = Math.min(Math.max(until, now + MIN_PAUSE_MS), now + MAX_PAUSE_MS);
+  if (until <= pausedUntil) return;
+  pausedUntil = until;
+  warn(
+    `Out of Claude usage${resetAt ? "" : " (couldn't tell when it resets, will check again)"}. ` +
+      `Pausing until ${formatTime(until)}; other agents take the tasks meanwhile.`
+  );
+}
+
+/** Save progress, hand the task back without using a retry, and pause */
+async function handBackForUsageLimit(claim, ws, job, agent, usage, log) {
+  log("system", `Claude usage limit reached: ${agent.usageLimit.message}`);
+  pauseForUsageLimit(agent.usageLimit.resetAt);
+
+  const checkpoint = await saveCheckpoint(claim, ws, job, log, "out of Claude usage");
+  const madeProgress = !!(checkpoint.branchName || checkpoint.note);
+  await flushLogs(job);
+  await apiWithRetry("POST", `/api/runner/tasks/${claim.task.id}/fail`, {
+    runId: claim.runId,
+    error: `${me.name} ran out of Claude usage`,
+    usage,
+    ...(madeProgress && { checkpoint }),
+    requeue: true,
+  }).catch((e) => warn(`Could not hand the task back to the board: ${e.message}`));
+  info(`~ Handed "${claim.task.title}" back to the board (out of Claude usage)`);
+  // Let the board show the pause right away rather than at the next check-in
+  await requestWork().catch(() => {});
+}
+
+/** Ask the board for a task, or just check in while paused */
+function requestWork() {
+  const paused = Date.now() < pausedUntil;
+  return api("POST", "/api/runner/claim", {
+    boardIds: config.boards,
+    concurrency: config.concurrency,
+    version: VERSION,
+    platform: `${process.platform}-${process.arch}`,
+    ...(paused && { pausedUntil: new Date(pausedUntil).toISOString() }),
+  });
+}
 
 /** Send buffered log lines, one batch at a time so they arrive in order */
 function flushLogs(job) {
@@ -784,7 +912,11 @@ async function runJob(claim) {
     usage = agent.usage;
     if (job.cancelled) return;
     if (agent.error) {
-      if (agent.outOfTurns) job.checkpoint = await saveCheckpoint(claim, ws, job, log);
+      if (agent.usageLimit) {
+        await handBackForUsageLimit(claim, ws, job, agent, usage, log);
+        return;
+      }
+      if (agent.outOfTurns) job.checkpoint = await saveCheckpoint(claim, ws, job, log, "ran out of turns");
       throw new Error(agent.error);
     }
     log("system", `Agent finished (${usage.inputTokens.toLocaleString()} in / ${usage.outputTokens.toLocaleString()} out tokens)`);
@@ -862,6 +994,7 @@ async function shutdown(code) {
       await api("POST", `/api/runner/tasks/${job.taskId}/fail`, {
         runId: job.runId,
         error: `Runner ${me.name} was shut down`,
+        requeue: true,
       }).catch(() => {});
     })
   );
@@ -932,20 +1065,21 @@ async function main() {
   process.on("SIGTERM", () => shutdown(0));
 
   let offline = false;
+  let wasPaused = false;
   while (!shuttingDown) {
-    if (jobs.size < config.concurrency) {
+    const paused = Date.now() < pausedUntil;
+    if (wasPaused && !paused) info("Claude usage should have reset. Looking for tasks again.");
+    wasPaused = paused;
+
+    // While paused we still check in, so the board shows why, but take no work
+    if (paused || jobs.size < config.concurrency) {
       try {
-        const claim = await api("POST", "/api/runner/claim", {
-          boardIds: config.boards,
-          concurrency: config.concurrency,
-          version: VERSION,
-          platform: `${process.platform}-${process.arch}`,
-        });
+        const claim = await requestWork();
         if (offline) {
           info("Reconnected to the board");
           offline = false;
         }
-        if (claim) {
+        if (claim && !paused) {
           runJob(claim);
           continue; // look for more work straight away
         }
@@ -960,7 +1094,9 @@ async function main() {
         }
       }
     }
-    await sleep(POLL_INTERVAL_MS);
+    await sleep(
+      paused ? Math.max(1_000, Math.min(PAUSED_CHECK_IN_MS, pausedUntil - Date.now())) : POLL_INTERVAL_MS
+    );
   }
 }
 

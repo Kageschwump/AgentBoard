@@ -40,11 +40,11 @@ export interface ClaimPayload {
   repo: { url: string; baseBranch: string; gitProvider: string } | null;
   /** Agent turn limit from the task or board; null = the runner's own default */
   maxTurns: number | null;
-  /** Progress saved by an earlier attempt that ran out of turns */
+  /** Progress saved by an earlier attempt that stopped early (out of turns or usage) */
   resume: { branch: string; note: string } | null;
 }
 
-/** Partial work saved by an attempt that ran out of turns */
+/** Partial work saved by an attempt that stopped early */
 export interface Checkpoint {
   branchName: string;
   note: string;
@@ -317,30 +317,39 @@ export async function completeRun(
   return true;
 }
 
+export interface RunFailure {
+  error: string;
+  usage?: RunUsage;
+  checkpoint?: Checkpoint;
+  /**
+   * False when the task isn't to blame (runner stopped, revoked, or out of
+   * Claude usage): hand it back to Ready without using up a retry.
+   */
+  countAsRetry?: boolean;
+}
+
 /**
- * End the current attempt as failed: re-queue it if retries remain,
- * otherwise mark it failed.
+ * End the current attempt as failed: re-queue it if retries remain (or it
+ * doesn't count as a retry), otherwise mark it failed.
  */
 async function failActiveRun(
   where: { id: string; runId: string; runnerId?: string },
-  error: string,
-  usage?: RunUsage,
-  checkpoint?: Checkpoint
+  { error, usage, checkpoint, countAsRetry = true }: RunFailure
 ): Promise<boolean> {
   const task = await prisma.task.findFirst({ where: { ...where, status: "in_progress" } });
   if (!task) return false;
 
-  const willRetry = task.retryCount < task.maxRetries;
+  const willRetry = !countAsRetry || task.retryCount < task.maxRetries;
   const { count } = await prisma.task.updateMany({
     where: { id: task.id, runId: task.runId, status: "in_progress" },
     data: {
       status: willRetry ? "ready" : "failed",
       error,
       heartbeatAt: null,
-      ...(willRetry && { retryCount: { increment: 1 } }),
+      ...(willRetry && countAsRetry && { retryCount: { increment: 1 } }),
       ...usageIncrement(usage),
-      // Without a new checkpoint, any earlier one stays for the next attempt
-      // A non-empty note is what marks an out-of-turns checkpoint (vs. a send-back)
+      // Without a new checkpoint, any earlier one stays for the next attempt.
+      // A non-empty note is what marks a checkpoint (vs. a send-back).
       ...(checkpoint && {
         resumeNote: checkpoint.note.trim() || "(The previous attempt didn't leave a message.)",
         ...(checkpoint.branchName && {
@@ -362,9 +371,11 @@ async function failActiveRun(
 
   await writeSystemLog(
     task.id,
-    willRetry
-      ? `Attempt failed: ${error}. Re-queued (retry ${task.retryCount + 1}/${task.maxRetries}).`
-      : `Task failed: ${error}`
+    !countAsRetry
+      ? `${error}. Handed back to the queue (doesn't count as a retry).`
+      : willRetry
+        ? `Attempt failed: ${error}. Re-queued (retry ${task.retryCount + 1}/${task.maxRetries}).`
+        : `Task failed: ${error}`
   );
   emitEvent({ type: "task:updated", taskId: task.id });
   emitEvent({ type: "runners:updated" });
@@ -386,21 +397,19 @@ export function failRun(
   runner: Runner,
   taskId: string,
   runId: string,
-  error: string,
-  usage?: RunUsage,
-  checkpoint?: Checkpoint
+  failure: RunFailure
 ): Promise<boolean> {
-  return failActiveRun({ id: taskId, runId, runnerId: runner.id }, error, usage, checkpoint);
+  return failActiveRun({ id: taskId, runId, runnerId: runner.id }, failure);
 }
 
-/** Fail every run a runner currently holds (used when its token is revoked) */
+/** Hand back every run a runner currently holds (used when its token is revoked) */
 export async function failRunsForRunner(runnerId: string, error: string) {
   const tasks = await prisma.task.findMany({
     where: { runnerId, status: "in_progress" },
     select: { id: true, runId: true },
   });
   for (const task of tasks) {
-    await failActiveRun(task, error);
+    await failActiveRun(task, { error, countAsRetry: false });
   }
 }
 
@@ -417,7 +426,9 @@ export async function reapStaleRuns() {
   for (const task of stale) {
     await failActiveRun(
       { id: task.id, runId: task.runId },
-      `Lost contact with ${task.runnerName || "the runner"} (no heartbeat for ${HEARTBEAT_TIMEOUT_MS / 1000}s)`
+      {
+        error: `Lost contact with ${task.runnerName || "the runner"} (no heartbeat for ${HEARTBEAT_TIMEOUT_MS / 1000}s)`,
+      }
     );
   }
 }

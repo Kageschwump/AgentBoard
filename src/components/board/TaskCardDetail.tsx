@@ -577,7 +577,7 @@ export function TaskCardDetail({
             />
           </div>
 
-          {/* Saved progress from an attempt that ran out of turns */}
+          {/* Saved progress from an attempt that stopped early */}
           {task.resumeNote && (
             <div className="rounded-md bg-blue-500/10 p-3">
               <div className="flex items-center justify-between">
@@ -593,7 +593,7 @@ export function TaskCardDetail({
                 )}
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                An earlier attempt ran out of turns.{" "}
+                An earlier attempt stopped before finishing.{" "}
                 {task.status === TaskStatus.IN_PROGRESS ? "This attempt continues" : "The next attempt continues"}{" "}
                 from{" "}
                 {task.resumeBranch ? (

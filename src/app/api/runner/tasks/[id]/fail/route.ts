@@ -15,6 +15,8 @@ const failSchema = z.object({
       diff: z.string().optional().default(""),
     })
     .optional(),
+  // Not the task's fault (runner stopping, out of Claude usage): don't use up a retry
+  requeue: z.boolean().optional().default(false),
 });
 
 export async function POST(
@@ -29,9 +31,14 @@ export async function POST(
   if (!parsed.success) {
     return NextResponse.json({ error: "Invalid failure report" }, { status: 400 });
   }
-  const { runId, error, usage, checkpoint } = parsed.data;
+  const { runId, error, usage, checkpoint, requeue } = parsed.data;
 
-  const ok = await failRun(auth.runner, id, runId, error, usage, checkpoint);
+  const ok = await failRun(auth.runner, id, runId, {
+    error,
+    usage,
+    checkpoint,
+    countAsRetry: !requeue,
+  });
   if (!ok) {
     return NextResponse.json({ error: "Run is no longer active" }, { status: 409 });
   }

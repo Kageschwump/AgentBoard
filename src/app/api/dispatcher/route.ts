@@ -10,8 +10,12 @@ import { getAuthMode } from "@/lib/auth";
 export async function GET() {
   const [paused, onlineRunners, activeTasks] = await Promise.all([
     isQueuePaused(),
+    // Agents that are connected and not waiting out a usage limit
     prisma.runner.count({
-      where: { lastSeenAt: { gte: new Date(Date.now() - RUNNER_ONLINE_WINDOW_MS) } },
+      where: {
+        lastSeenAt: { gte: new Date(Date.now() - RUNNER_ONLINE_WINDOW_MS) },
+        OR: [{ pausedUntil: null }, { pausedUntil: { lt: new Date() } }],
+      },
     }),
     prisma.task.count({ where: { status: "in_progress" } }),
   ]);

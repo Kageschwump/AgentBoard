@@ -28,6 +28,7 @@ A shared Kanban board where AI agents pick up and do the work. Host the board on
 - **Checkpoints**: an attempt that runs out of turns pushes its partial work, and the next attempt (on anyone's machine) continues from it
 - **Suggestions**: leave feedback on a finished task (say, after playtesting) and send it back; an agent picks it up and updates the same branch and PR
 - **Turn limits**: set how many steps agents get per board, or per task
+- **Usage limits**: when someone runs out of Claude usage, their runner saves its progress, hands the task to the others, and pauses itself until the limit resets
 - **Manual controls**: stop a running agent, retry, pause the whole queue
 - **Dependencies, priorities, scheduling and cron**, a skills library, shared board memory, cost analytics, and Slack/webhook integrations
 
@@ -96,7 +97,7 @@ Invoke-WebRequest https://your-board.example.com/agentboard-runner.mjs -OutFile 
 node agentboard-runner.mjs --server https://your-board.example.com --token abr_...
 ```
 
-The runner saves its settings to `~/.agentboard-runner/config.json`, so after the first run `node agentboard-runner.mjs` is enough. Stop it with Ctrl+C; anything it was working on goes back to Ready.
+The runner saves its settings to `~/.agentboard-runner/config.json`, so after the first run `node agentboard-runner.mjs` is enough. Stop it with Ctrl+C; anything it was working on goes back to Ready without using up a retry.
 
 | Runner option | Default | |
 |---|---|---|
@@ -114,6 +115,7 @@ The runner saves its settings to `~/.agentboard-runner/config.json`, so after th
 
 - **Boards with a repo** (set the git URL under **Board Settings**): the runner clones the repo, works in a fresh worktree on `task/<title>-<id>`, then commits, pushes, and opens a PR with its owner's git and `gh` credentials. The task moves to **Review** with the diff attached. **Everyone running an agent needs push access to the repo** (on GitHub, add them as collaborators). A task can override the repo with its own git URL.
 - **Running out of turns**: agents get a limited number of steps (Board Settings → *Max turns per task*, overridable per task). If an attempt runs out, the runner commits and pushes what it has, and the next attempt starts from that branch with the previous attempt's last message, instead of starting over. The card shows *Saved progress*; **Discard** in the task panel makes the next attempt start fresh.
+- **Running out of Claude usage**: when a runner's owner hits their Claude usage limit, the runner saves the task's progress the same way, hands it back to Ready without using up a retry (so someone else's agent can continue it), and pauses until the limit resets. Claude Code usually says when; if it doesn't, the runner checks again every 30 minutes. The Agents panel shows *Out of Claude usage until …* in the meantime.
 - **Suggestions**: once a task has run, its panel has a *Suggestions* box. Add as many as you like, then click **Send to an agent**. The task goes back to Ready with the suggestions in the agent's instructions. A task in Review continues on its branch, so the open PR simply gets updated. Suggestions are ticked off when an agent finishes successfully.
 - **Boards without a repo**: the agent works in a scratch folder on the runner's machine. Its logs and summary are visible on the board, but the files stay on that machine.
 

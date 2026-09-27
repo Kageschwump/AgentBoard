@@ -35,6 +35,8 @@ export async function GET() {
       concurrency: runner.concurrency,
       createdAt: runner.createdAt,
       online: isRunnerOnline(runner.lastSeenAt),
+      pausedUntil:
+        runner.pausedUntil && runner.pausedUntil > new Date() ? runner.pausedUntil : null,
       outdated: !!runner.version && !!latestVersion && runner.version !== latestVersion,
       activeTasks: runner.tasks,
     }))
