@@ -34,7 +34,7 @@ export function useCreateBoard() {
     mutationFn: async (data: {
       name: string;
       description?: string;
-      repoPath?: string;
+      repoUrl?: string;
       baseBranch?: string;
       gitProvider?: string;
     }) => {
@@ -65,7 +65,7 @@ export function useUpdateBoard() {
       id: string;
       name?: string;
       description?: string;
-      repoPath?: string;
+      repoUrl?: string;
       baseBranch?: string;
       gitProvider?: string;
     }) => {
@@ -233,42 +233,97 @@ export function useDispatcherStatus() {
     queryKey: ["dispatcher"],
     queryFn: async () => {
       const res = await fetch("/api/dispatcher");
-      if (!res.ok) throw new Error("Failed to fetch dispatcher status");
+      if (!res.ok) throw new Error("Failed to fetch queue status");
       return res.json() as Promise<{
         running: boolean;
+        onlineRunners: number;
         activeTasks: number;
-        maxConcurrent: number;
+        canMergePrs: boolean;
+        authEnabled: boolean;
       }>;
     },
+    refetchInterval: 15_000, // runners drop offline without an event
   });
 }
 
-export function useSettings() {
-  return useQuery({
-    queryKey: ["settings"],
-    queryFn: async () => {
-      const res = await fetch("/api/settings");
-      if (!res.ok) throw new Error("Failed to fetch settings");
-      return res.json() as Promise<{ maxConcurrent: number }>;
-    },
-  });
-}
-
-export function useUpdateSetting() {
+export function useToggleQueue() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (data: { key: string; value: string }) => {
-      const res = await fetch("/api/settings", {
-        method: "PUT",
+    mutationFn: async (running: boolean) => {
+      const res = await fetch("/api/dispatcher", {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
+        body: JSON.stringify({ action: running ? "start" : "stop" }),
       });
-      if (!res.ok) throw new Error("Failed to update setting");
+      if (!res.ok) throw new Error("Failed to update the queue");
       return res.json();
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["settings"] });
       queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
+    },
+  });
+}
+
+// Runner (connected agent) hooks
+export interface RunnerInfo {
+  id: string;
+  name: string;
+  owner: string;
+  tokenPrefix: string;
+  lastSeenAt: string | null;
+  version: string;
+  platform: string;
+  concurrency: number;
+  createdAt: string;
+  online: boolean;
+  activeTasks: { id: string; title: string }[];
+}
+
+export function useRunnersQuery(enabled = true) {
+  return useQuery({
+    queryKey: ["runners"],
+    queryFn: async (): Promise<RunnerInfo[]> => {
+      const res = await fetch("/api/runners");
+      if (!res.ok) throw new Error("Failed to fetch agents");
+      return res.json();
+    },
+    enabled,
+    refetchInterval: enabled ? 10_000 : false,
+  });
+}
+
+export function useCreateRunner() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (data: { name: string; owner?: string }) => {
+      const res = await fetch("/api/runners", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to create agent");
+      }
+      return res.json() as Promise<{ id: string; name: string; owner: string; token: string }>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["runners"] });
+    },
+  });
+}
+
+export function useDeleteRunner() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const res = await fetch(`/api/runners/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to disconnect agent");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["runners"] });
+      queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
   });
 }

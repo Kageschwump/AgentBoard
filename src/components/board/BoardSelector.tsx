@@ -37,10 +37,10 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
   const [createOpen, setCreateOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newName, setNewName] = useState("");
-  const [newRepoPath, setNewRepoPath] = useState("");
+  const [newRepoUrl, setNewRepoUrl] = useState("");
   const [newBaseBranch, setNewBaseBranch] = useState("main");
   const [newGitProvider, setNewGitProvider] = useState("");
-  const [editRepoPath, setEditRepoPath] = useState("");
+  const [editRepoUrl, setEditRepoUrl] = useState("");
   const [editBaseBranch, setEditBaseBranch] = useState("main");
   const [editGitProvider, setEditGitProvider] = useState("");
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
@@ -54,7 +54,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
     createBoard.mutate(
       {
         name: newName.trim(),
-        repoPath: newRepoPath.trim(),
+        repoUrl: newRepoUrl.trim(),
         baseBranch: newBaseBranch.trim() || "main",
         gitProvider: newGitProvider,
       },
@@ -63,7 +63,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
           toast.success(`Board "${board.name}" created`);
           onBoardChange(board.id);
           setNewName("");
-          setNewRepoPath("");
+          setNewRepoUrl("");
           setNewBaseBranch("main");
           setNewGitProvider("");
           setCreateOpen(false);
@@ -75,9 +75,9 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
 
   const handleOpenSettings = () => {
     if (currentBoard) {
-      setEditRepoPath((currentBoard as { repoPath?: string }).repoPath || "");
-      setEditBaseBranch((currentBoard as { baseBranch?: string }).baseBranch || "main");
-      setEditGitProvider((currentBoard as { gitProvider?: string }).gitProvider || "");
+      setEditRepoUrl(currentBoard.repoUrl || "");
+      setEditBaseBranch(currentBoard.baseBranch || "main");
+      setEditGitProvider(currentBoard.gitProvider || "");
     }
     setSettingsOpen(true);
   };
@@ -87,7 +87,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
     updateBoard.mutate(
       {
         id: boardId,
-        repoPath: editRepoPath.trim(),
+        repoUrl: editRepoUrl.trim(),
         baseBranch: editBaseBranch.trim() || "main",
         gitProvider: editGitProvider,
       },
@@ -121,7 +121,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
         <DropdownMenuTrigger asChild>
           <Button variant="outline" size="sm" className="gap-1">
             {displayName}
-            {(currentBoard as { repoPath?: string })?.repoPath && (
+            {currentBoard?.repoUrl && (
               <span className="ml-1 text-[10px] text-muted-foreground" title="Git-connected board">
                 [git]
               </span>
@@ -138,7 +138,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
             >
               <span className={board.id === boardId ? "font-semibold" : ""}>
                 {board.name}
-                {(board as { repoPath?: string }).repoPath && (
+                {board.repoUrl && (
                   <span className="ml-1 text-[10px] text-muted-foreground">[git]</span>
                 )}
               </span>
@@ -183,19 +183,19 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
             </div>
             <div>
               <label className="mb-1 block text-sm font-medium">
-                Git Repository Path
+                Git Repository URL
               </label>
               <Input
-                value={newRepoPath}
-                onChange={(e) => setNewRepoPath(e.target.value)}
-                placeholder="e.g., /home/user/my-project (optional)"
+                value={newRepoUrl}
+                onChange={(e) => setNewRepoUrl(e.target.value)}
+                placeholder="e.g., https://github.com/you/project.git (optional)"
                 className="font-mono text-sm"
               />
               <p className="mt-1 text-xs text-muted-foreground">
-                Each task gets its own branch and PR. Leave empty for non-git workflows.
+                Agents clone this repo and open a PR per task using their own git access. Leave empty for tasks that don&apos;t touch code.
               </p>
             </div>
-            {newRepoPath && (
+            {newRepoUrl && (
               <>
                 <div>
                   <label className="mb-1 block text-sm font-medium">
@@ -249,16 +249,16 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
           <form onSubmit={handleSaveSettings} className="space-y-4">
             <div>
               <label className="mb-1 block text-sm font-medium">
-                Git Repository Path
+                Git Repository URL
               </label>
               <Input
-                value={editRepoPath}
-                onChange={(e) => setEditRepoPath(e.target.value)}
-                placeholder="e.g., /home/user/my-project (optional)"
+                value={editRepoUrl}
+                onChange={(e) => setEditRepoUrl(e.target.value)}
+                placeholder="e.g., https://github.com/you/project.git (optional)"
                 className="font-mono text-sm"
               />
               <p className="mt-1 text-xs text-muted-foreground">
-                Point to a local git clone. Each task will get its own worktree and branch.
+                Agents clone this repo, work on a branch per task, push it and open a PR with their own git/gh credentials. Everyone running an agent needs push access.
               </p>
             </div>
             <div>
@@ -289,7 +289,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
                 <option value="github">GitHub</option>
               </select>
               <p className="mt-1 text-xs text-muted-foreground">
-                Azure DevOps uses <code>az repos pr</code>. GitHub uses <code>gh</code> CLI.
+                PRs are opened on the agent&apos;s machine: <code>gh</code> for GitHub, <code>az repos pr</code> for Azure DevOps.
               </p>
             </div>
             <div className="flex justify-end gap-2">

@@ -1,0 +1,878 @@
+#!/usr/bin/env node
+/**
+ * AgentBoard runner: connects Claude Code on your machine to a shared AgentBoard.
+ *
+ * It asks the board for ready tasks, runs `claude` locally with your own login,
+ * streams the output back to the board, and for boards with a git repo it
+ * pushes a branch and opens a PR using your own git / gh credentials.
+ *
+ *   node agentboard-runner.mjs --server https://your-board.example.com --token abr_...
+ *
+ * Needs Node 18+, Claude Code (`claude`) logged in, git, and gh for GitHub PRs.
+ * No npm install required.
+ */
+import { spawn, spawnSync } from "node:child_process";
+import { parseArgs } from "node:util";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const VERSION = "1.0.0";
+const POLL_INTERVAL_MS = 5_000;
+const HEARTBEAT_INTERVAL_MS = 5_000;
+const LOG_FLUSH_INTERVAL_MS = 1_000;
+const MAX_PENDING_LOGS = 5_000;
+const MAX_DIFF_CHARS = 1_000_000;
+const SUMMARY_TIMEOUT_MS = 120_000;
+const IS_WINDOWS = process.platform === "win32";
+const DEFAULT_DIR = path.join(os.homedir(), ".agentboard-runner");
+
+const HELP = `AgentBoard runner ${VERSION}
+
+Usage:
+  node agentboard-runner.mjs --server <url> --token <token> [options]
+
+Options:
+  --server <url>             Board URL (or AGENTBOARD_SERVER)
+  --token <token>            Runner token from the board's Agents panel (or AGENTBOARD_TOKEN)
+  --concurrency <n>          Tasks to run at once (default 1)
+  --board <id>               Only take tasks from this board (repeatable)
+  --workdir <dir>            Where repos and task folders live (default ~/.agentboard-runner)
+  --claude <path>            Claude Code executable (default "claude")
+  --permission-mode <mode>   Claude permission mode (default bypassPermissions;
+                             acceptEdits blocks commands that would need approval)
+  --max-turns <n>            Max agent turns per task (default 50)
+  --no-summary               Skip the post-task summary (saves a small Haiku call)
+  --config <file>            Settings file (default ~/.agentboard-runner/config.json)
+  -v, --verbose              Print all agent output, not just progress
+  -h, --help                 Show this help
+
+Settings are saved to the config file after the first successful
+connection, so next time you can just run: node agentboard-runner.mjs`;
+
+// ── Config ─────────────────────────────────────────────────────────
+
+let flags;
+try {
+  ({ values: flags } = parseArgs({
+    options: {
+      server: { type: "string" },
+      token: { type: "string" },
+      concurrency: { type: "string" },
+      board: { type: "string", multiple: true },
+      workdir: { type: "string" },
+      claude: { type: "string" },
+      "permission-mode": { type: "string" },
+      "max-turns": { type: "string" },
+      "no-summary": { type: "boolean" },
+      config: { type: "string" },
+      verbose: { type: "boolean", short: "v" },
+      help: { type: "boolean", short: "h" },
+    },
+  }));
+} catch (err) {
+  console.error(`${err.message}\n\n${HELP}`);
+  process.exit(1);
+}
+
+const CONFIG_FILE = path.resolve(flags.config ?? path.join(DEFAULT_DIR, "config.json"));
+
+function readSavedConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+const saved = readSavedConfig();
+const config = {
+  server: (flags.server ?? process.env.AGENTBOARD_SERVER ?? saved.server ?? "").replace(/\/+$/, ""),
+  token: flags.token ?? process.env.AGENTBOARD_TOKEN ?? saved.token ?? "",
+  concurrency: Math.max(1, parseInt(flags.concurrency ?? saved.concurrency ?? "1", 10) || 1),
+  boards: flags.board ?? saved.boards ?? [],
+  workdir: path.resolve(flags.workdir ?? saved.workdir ?? DEFAULT_DIR),
+  claude: flags.claude ?? saved.claude ?? "claude",
+  permissionMode: flags["permission-mode"] ?? saved.permissionMode ?? "bypassPermissions",
+  maxTurns: Math.max(1, parseInt(flags["max-turns"] ?? saved.maxTurns ?? "50", 10) || 50),
+  summary: !(flags["no-summary"] ?? saved.noSummary ?? false),
+  verbose: !!flags.verbose,
+};
+
+function saveConfig() {
+  const data = {
+    server: config.server,
+    token: config.token,
+    concurrency: String(config.concurrency),
+    boards: config.boards,
+    workdir: config.workdir,
+    claude: config.claude,
+    permissionMode: config.permissionMode,
+    maxTurns: String(config.maxTurns),
+    noSummary: !config.summary,
+  };
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
+  } catch (err) {
+    warn(`Could not save settings: ${err.message}`);
+  }
+}
+
+// ── Output ─────────────────────────────────────────────────────────
+
+function stamp() {
+  return new Date().toLocaleTimeString([], { hour12: false });
+}
+function info(msg) {
+  console.log(`${stamp()}  ${msg}`);
+}
+function warn(msg) {
+  console.warn(`${stamp()}  ! ${msg}`);
+}
+
+// ── Board API ──────────────────────────────────────────────────────
+
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function api(method, pathname, body) {
+  let res;
+  try {
+    res = await fetch(config.server + pathname, {
+      method,
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json",
+        "User-Agent": `agentboard-runner/${VERSION}`,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    throw new ApiError(err.cause?.message || err.message, 0);
+  }
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(data.error || `HTTP ${res.status}`, res.status);
+  return data;
+}
+
+/** Retry calls whose loss would make the board redo finished work */
+async function apiWithRetry(method, pathname, body, attempts = 5) {
+  for (let i = 1; ; i++) {
+    try {
+      return await api(method, pathname, body);
+    } catch (err) {
+      // 4xx means the board heard us and said no; retrying won't help
+      if (i >= attempts || (err.status >= 400 && err.status < 500)) throw err;
+      await sleep(2_000 * i);
+    }
+  }
+}
+
+// ── Processes ──────────────────────────────────────────────────────
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Set by a surrounding Claude Code session (if the runner was started from one).
+// Config like CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CONFIG_DIR is kept.
+const CLAUDE_SESSION_VARS =
+  /^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_CODE_(ENTRYPOINT|SSE_PORT|EXECPATH|CHILD_SESSION|SESSION_\w+|MESSAGING_\w+))$/;
+
+/** Environment for child processes, without markers that make Claude think it's nested */
+function childEnv() {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  for (const key of Object.keys(env)) {
+    if (CLAUDE_SESSION_VARS.test(key)) delete env[key];
+  }
+  return env;
+}
+
+/** Quote an argument for cmd.exe (only used for .cmd shims like claude/az on Windows) */
+function winQuote(arg) {
+  if (/^[\w\-.:\\/=@]+$/.test(arg)) return arg;
+  return `"${arg.replace(/["%^&|<>\r\n]/g, " ")}"`;
+}
+
+/**
+ * Spawn a command. On Windows, commands like claude and az are often .cmd
+ * shims that need a shell, so they go through cmd.exe with quoted args.
+ */
+function spawnCommand(cmd, args, { cwd, useShell = false } = {}) {
+  const common = { cwd, env: childEnv(), stdio: ["pipe", "pipe", "pipe"], windowsHide: true };
+  if (IS_WINDOWS && useShell) {
+    return spawn([winQuote(cmd), ...args.map(winQuote)].join(" "), { ...common, shell: true });
+  }
+  // Own process group on Unix so we can kill the whole agent tree
+  return spawn(cmd, args, { ...common, detached: !IS_WINDOWS });
+}
+
+/** Run a command to completion; resolves stdout, rejects with stderr */
+function run(cmd, args, { cwd, timeout = 120_000, input, useShell = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawnCommand(cmd, args, { cwd, useShell });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      killTree(child);
+      reject(new Error(`${cmd} ${args[0] ?? ""} timed out`));
+    }, timeout);
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err.code === "ENOENT" ? new Error(`${cmd} is not installed or not on PATH`) : err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`${cmd} ${args.slice(0, 2).join(" ")} failed: ${(stderr || stdout).trim().slice(0, 1000)}`));
+    });
+    child.stdin.end(input ?? "");
+  });
+}
+
+function killTree(child) {
+  if (!child || !child.pid || child.exitCode !== null) return;
+  if (IS_WINDOWS) {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    // already gone
+  }
+  setTimeout(() => {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }, 5_000).unref();
+}
+
+const git = (args, cwd, timeout) => run("git", args, { cwd, timeout });
+
+// One git setup/teardown at a time per repo clone
+const repoLocks = new Map();
+function withRepoLock(key, fn) {
+  const prev = repoLocks.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  repoLocks.set(key, next.catch(() => {}));
+  return next;
+}
+
+// ── Git workspace ──────────────────────────────────────────────────
+
+function slugify(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+}
+
+function repoDirName(url) {
+  const name = slugify(url.replace(/\.git$/, "").split(/[/\\:]/).pop() || "repo");
+  return `${name}-${createHash("sha1").update(url).digest("hex").slice(0, 8)}`;
+}
+
+async function firstExistingRef(repoDir, refs) {
+  for (const ref of refs) {
+    try {
+      await git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], repoDir);
+      return ref;
+    } catch {
+      // try the next one
+    }
+  }
+  throw new Error("Repository has no commits to branch from");
+}
+
+async function prepareWorkspace(claim, log) {
+  const { task, repo } = claim;
+
+  if (!repo) {
+    const dir = path.join(config.workdir, "tasks", task.id);
+    fs.mkdirSync(dir, { recursive: true });
+    return { dir, repo: null };
+  }
+
+  const repoDir = path.join(config.workdir, "repos", repoDirName(repo.url));
+  const branchName = `task/${slugify(task.title) || "task"}-${task.id.slice(-8)}`;
+  const dir = path.join(config.workdir, "worktrees", task.id);
+
+  return withRepoLock(repoDir, async () => {
+    if (!fs.existsSync(path.join(repoDir, ".git"))) {
+      log("system", `Cloning ${repo.url}`);
+      fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+      await git(["clone", repo.url, repoDir], config.workdir, 30 * 60_000);
+    } else {
+      try {
+        await git(["fetch", "origin", "--prune"], repoDir, 5 * 60_000);
+      } catch (err) {
+        log("system", `git fetch failed, using the local copy: ${err.message}`);
+      }
+    }
+
+    // Clear leftovers from an earlier attempt at this task
+    await git(["worktree", "prune"], repoDir).catch(() => {});
+    if (fs.existsSync(dir)) {
+      await git(["worktree", "remove", "--force", dir], repoDir).catch(() => {});
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    await git(["branch", "-D", branchName], repoDir).catch(() => {});
+
+    const startPoint = await firstExistingRef(repoDir, [
+      `origin/${repo.baseBranch}`,
+      repo.baseBranch,
+      "HEAD",
+    ]);
+    await git(["worktree", "add", "-b", branchName, dir, startPoint], repoDir);
+    const baseCommit = (await git(["rev-parse", "HEAD"], dir)).trim();
+    log("system", `Working on branch ${branchName} (from ${startPoint})`);
+
+    return { dir, repo, repoDir, branchName, baseCommit, keep: false };
+  });
+}
+
+function detectProvider(url) {
+  return /dev\.azure\.com|visualstudio\.com/.test(url) ? "azuredevops" : "github";
+}
+
+function githubCompareUrl(repoUrl, base, branch) {
+  const match = repoUrl.match(/github\.com[/:]([^/]+)\/([^/]+?)(\.git)?$/);
+  return match ? `https://github.com/${match[1]}/${match[2]}/compare/${base}...${branch}?expand=1` : "";
+}
+
+async function openPullRequest(claim, ws) {
+  const { task, repo } = claim;
+  const title = task.title;
+  const body = `Automated PR from AgentBoard, made by ${me.name}.\n\nTask: ${task.title}`;
+  const provider = repo.gitProvider || detectProvider(repo.url);
+
+  if (provider === "azuredevops") {
+    const out = await run(
+      "az",
+      ["repos", "pr", "create", "--title", title, "--description", body,
+        "--source-branch", ws.branchName, "--target-branch", repo.baseBranch, "--output", "json"],
+      { cwd: ws.dir, timeout: 60_000, useShell: true }
+    );
+    const pr = JSON.parse(out);
+    return pr.repository?.webUrl && pr.pullRequestId
+      ? `${pr.repository.webUrl}/pullrequest/${pr.pullRequestId}`
+      : pr.url || "";
+  }
+
+  // A retried task force-pushes the same branch, so its PR may already exist
+  try {
+    const existing = (
+      await run("gh", ["pr", "view", ws.branchName, "--json", "url,state", "--jq", 'select(.state == "OPEN") | .url'], {
+        cwd: ws.dir,
+        timeout: 30_000,
+      })
+    ).trim();
+    if (existing) return existing;
+  } catch {
+    // no PR yet
+  }
+
+  const out = await run(
+    "gh",
+    ["pr", "create", "--title", title, "--body", body, "--base", repo.baseBranch, "--head", ws.branchName],
+    { cwd: ws.dir, timeout: 60_000 }
+  );
+  return out.trim().split("\n").pop() || "";
+}
+
+/** Commit whatever the agent changed, push the branch and open a PR */
+async function publishChanges(claim, ws, log) {
+  const { task, repo } = claim;
+  const noChanges = { branchName: "", prUrl: "", pushed: false, diff: "" };
+
+  await git(["add", "-A"], ws.dir);
+  const status = (await git(["status", "--porcelain"], ws.dir)).trim();
+  if (status) {
+    const hasIdentity = await git(["config", "user.email"], ws.dir).then((s) => !!s.trim(), () => false);
+    const identity = hasIdentity
+      ? []
+      : ["-c", "user.name=AgentBoard Runner", "-c", "user.email=agentboard-runner@users.noreply.github.com"];
+    await git([...identity, "commit", "-m", `[AgentBoard] ${task.title}`], ws.dir);
+  }
+
+  const ahead = parseInt((await git(["rev-list", "--count", `${ws.baseCommit}..HEAD`], ws.dir)).trim(), 10);
+  if (!ahead) {
+    log("system", "No file changes to publish");
+    return noChanges;
+  }
+
+  ws.keep = true; // committed but not pushed yet: don't delete it if the push fails
+  let diff = await git(["diff", `${ws.baseCommit}..HEAD`], ws.dir, 60_000).catch(() => "");
+  if (diff.length > MAX_DIFF_CHARS) {
+    diff = diff.slice(0, MAX_DIFF_CHARS) + "\n\n... diff truncated ...";
+  }
+
+  log("system", `Pushing ${ws.branchName}`);
+  // The branch belongs to this task; a retry replaces the previous attempt
+  await git(["push", "--force", "-u", "origin", ws.branchName], ws.dir, 5 * 60_000);
+  ws.keep = false;
+
+  let prUrl = "";
+  try {
+    prUrl = await openPullRequest(claim, ws);
+    if (prUrl) log("system", `PR: ${prUrl}`);
+  } catch (err) {
+    const compare = githubCompareUrl(repo.url, repo.baseBranch, ws.branchName);
+    log(
+      "system",
+      `Branch ${ws.branchName} is pushed but no PR was opened (${err.message}).` +
+        (compare ? ` Open one here: ${compare}` : "")
+    );
+  }
+
+  return { branchName: ws.branchName, prUrl, pushed: true, diff };
+}
+
+async function cleanupWorkspace(ws, log) {
+  if (!ws.repo) return; // plain task folders are kept so you can look at the output
+  if (ws.keep) {
+    log("system", `Unpushed work kept on ${me.name} at ${ws.dir}`);
+    return;
+  }
+  await withRepoLock(ws.repoDir, async () => {
+    await git(["worktree", "remove", "--force", ws.dir], ws.repoDir).catch(() => {});
+    await git(["branch", "-D", ws.branchName], ws.repoDir).catch(() => {});
+  });
+}
+
+// ── Claude ─────────────────────────────────────────────────────────
+
+function buildPrompt(claim, ws) {
+  let prompt = `You are an autonomous AI agent. Complete the following task without asking questions.
+Work in the current directory: ${ws.dir}`;
+  if (ws.branchName) {
+    prompt += `\nYou are working on branch: ${ws.branchName}`;
+    prompt += `\nDo NOT create new branches or switch branches. Stay on the current branch.`;
+    prompt += `\nDo NOT commit or push changes. The runner handles git automatically.`;
+  }
+  prompt += `\n\n${claim.instructions}`;
+  prompt += `\n\nDo not ask clarifying questions. Execute the task to completion.`;
+  return prompt;
+}
+
+function usageFromResult(result) {
+  const u = result?.usage ?? {};
+  const inputTokens =
+    (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+  const outputTokens = u.output_tokens ?? 0;
+  // Fallback estimate at Sonnet list prices if Claude didn't report a cost
+  const costEstimate =
+    typeof result?.total_cost_usd === "number"
+      ? result.total_cost_usd
+      : (inputTokens / 1e6) * 3 + (outputTokens / 1e6) * 15;
+  return { inputTokens, outputTokens, costEstimate: Math.round(costEstimate * 10000) / 10000 };
+}
+
+function addUsage(a, b) {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    costEstimate: Math.round((a.costEstimate + b.costEstimate) * 10000) / 10000,
+  };
+}
+
+const EMPTY_USAGE = { inputTokens: 0, outputTokens: 0, costEstimate: 0 };
+
+function claudeArgs(model, extra) {
+  const args = ["-p", ...extra];
+  if (model) {
+    if (/^[\w.\-[\]]+$/.test(model)) args.push("--model", model);
+    else warn(`Ignoring invalid model name "${model}"`);
+  }
+  return args;
+}
+
+/** Run the agent, streaming its output to the board */
+function runClaude(job, prompt, cwd, model, log) {
+  return new Promise((resolve) => {
+    const args = claudeArgs(model, [
+      "--output-format", "stream-json", "--verbose",
+      "--max-turns", String(config.maxTurns),
+      "--permission-mode", config.permissionMode,
+    ]);
+    const child = spawnCommand(config.claude, args, { cwd, useShell: true });
+    job.child = child;
+
+    let result = null;
+    let spawnError = null;
+    let buffered = "";
+    // Fallback usage if the run dies before its final result message
+    const seenMessages = new Map();
+
+    const handleLine = (line) => {
+      if (!line.trim()) return;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        log("stdout", line);
+        return;
+      }
+      if (msg.type === "assistant" && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === "text" && block.text) {
+            log("stdout", block.text);
+            job.transcript.push(block.text);
+          } else if (block.type === "tool_use") {
+            const text = `[Tool: ${block.name}] ${JSON.stringify(block.input).slice(0, 200)}`;
+            log("stdout", text);
+            job.transcript.push(text);
+          }
+        }
+        if (msg.message.usage && msg.message.id) {
+          seenMessages.set(msg.message.id, msg.message.usage);
+        }
+      } else if (msg.type === "result") {
+        result = msg;
+        // The final result usually repeats the last assistant message
+        if (msg.result && msg.result !== job.transcript.at(-1)) log("stdout", msg.result);
+      }
+    };
+
+    child.stdout.on("data", (data) => {
+      buffered += data.toString();
+      const lines = buffered.split("\n");
+      buffered = lines.pop();
+      lines.forEach(handleLine);
+    });
+    child.stderr.on("data", (data) => {
+      const text = data.toString().trim();
+      if (text) log("stderr", text);
+    });
+    child.on("error", (err) => {
+      spawnError = err;
+    });
+    child.on("close", (code) => {
+      handleLine(buffered);
+      const usage = result
+        ? usageFromResult(result)
+        : [...seenMessages.values()].reduce(
+            (acc, u) => addUsage(acc, usageFromResult({ usage: u })),
+            EMPTY_USAGE
+          );
+
+      let error = "";
+      if (spawnError) error = `Could not start Claude (${config.claude}): ${spawnError.message}`;
+      else if (result?.subtype === "error_max_turns") error = `Agent hit the max turns limit (${config.maxTurns})`;
+      else if (result?.is_error) error = `Agent reported an error: ${String(result.result || result.subtype).slice(0, 500)}`;
+      else if (code !== 0) error = `Claude exited with code ${code}`;
+
+      resolve({ error, usage, resultText: result?.result ?? "" });
+    });
+
+    child.stdin.end(prompt);
+  });
+}
+
+/** Ask Haiku for a short summary and reusable project knowledge */
+async function summarize(job, cwd) {
+  const transcript = job.transcript.join("\n").slice(-8000);
+  if (!transcript) return { summary: "", memories: [], usage: EMPTY_USAGE };
+
+  const prompt = `Summarize what this AI agent did and extract reusable project knowledge.
+Reply with ONLY a JSON object, no code fences:
+{"summary": "one string of 3-5 concise '- ' bullet lines on actions taken and outcomes (files changed, commands run, decisions made)",
+ "memories": [{"key": "...", "value": "..."}]}
+Only put stable, reusable facts in memories (conventions, file paths, patterns). Use [] if there are none.
+
+Agent logs:
+${transcript}`;
+
+  const out = await run(config.claude, claudeArgs("haiku", ["--output-format", "json"]), {
+    cwd,
+    input: prompt,
+    timeout: SUMMARY_TIMEOUT_MS,
+    useShell: true,
+  });
+  const envelope = JSON.parse(out);
+  const usage = usageFromResult(envelope);
+  let text = String(envelope.result ?? "").trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) text = fenced[1].trim();
+
+  try {
+    const parsed = JSON.parse(text);
+    const memories = Array.isArray(parsed.memories)
+      ? parsed.memories
+          .filter((m) => m && m.key && m.value)
+          .slice(0, 20)
+          .map((m) => ({ key: String(m.key), value: String(m.value) }))
+      : [];
+    const summary = Array.isArray(parsed.summary)
+      ? parsed.summary.map((line) => `- ${String(line).replace(/^[-*•]\s*/, "")}`).join("\n")
+      : String(parsed.summary ?? "").trim();
+    return { summary, memories, usage };
+  } catch {
+    return { summary: text, memories: [], usage };
+  }
+}
+
+// ── Jobs ───────────────────────────────────────────────────────────
+
+const jobs = new Map();
+let me = { name: "runner" };
+let shuttingDown = false;
+
+/** Send buffered log lines, one batch at a time so they arrive in order */
+function flushLogs(job) {
+  job.flushChain = job.flushChain.then(() => sendPendingLogs(job));
+  return job.flushChain;
+}
+
+async function sendPendingLogs(job) {
+  while (job.pending.length > 0 && !job.superseded) {
+    const batch = job.pending.splice(0, 500);
+    try {
+      await api("POST", `/api/runner/tasks/${job.taskId}/logs`, { runId: job.runId, logs: batch });
+    } catch (err) {
+      if (err.status === 409) {
+        job.superseded = true; // the board moved on from this run
+      } else {
+        job.pending.unshift(...batch); // try again on the next tick
+        if (job.pending.length > MAX_PENDING_LOGS) job.pending.splice(0, job.pending.length - MAX_PENDING_LOGS);
+      }
+      return;
+    }
+  }
+}
+
+async function runJob(claim) {
+  const { runId, task } = claim;
+  const short = task.id.slice(-8);
+  const job = {
+    taskId: task.id,
+    runId,
+    child: null,
+    cancelled: false,
+    superseded: false,
+    pending: [],
+    flushChain: Promise.resolve(),
+    transcript: [],
+  };
+  jobs.set(task.id, job);
+
+  const log = (stream, content) => {
+    job.pending.push({ stream, content });
+    if (config.verbose || stream === "system") {
+      info(`[${short}] ${content.split("\n")[0].slice(0, 200)}`);
+    }
+  };
+
+  const flushTimer = setInterval(() => flushLogs(job).catch(() => {}), LOG_FLUSH_INTERVAL_MS);
+
+  const heartbeatTimer = setInterval(async () => {
+    try {
+      const { cancel } = await api("POST", `/api/runner/tasks/${task.id}/heartbeat`, { runId });
+      if (cancel && !job.cancelled) {
+        job.cancelled = true;
+        log("system", "The board cancelled this run, stopping the agent");
+        killTree(job.child);
+      }
+    } catch {
+      // transient; the board re-queues the task if heartbeats stop for long
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  info(`> Picked up "${task.title}" [${short}]`);
+  let ws = null;
+  let usage = EMPTY_USAGE;
+
+  try {
+    ws = await prepareWorkspace(claim, log);
+    const agent = await runClaude(job, buildPrompt(claim, ws), ws.dir, task.model, log);
+    usage = agent.usage;
+    if (job.cancelled) return;
+    if (agent.error) throw new Error(agent.error);
+    log("system", `Agent finished (${usage.inputTokens.toLocaleString()} in / ${usage.outputTokens.toLocaleString()} out tokens)`);
+
+    const published = ws.repo
+      ? await publishChanges(claim, ws, log)
+      : { branchName: "", prUrl: "", pushed: false, diff: "" };
+    if (!ws.repo) log("system", `Output files are in ${ws.dir} on ${me.name}`);
+
+    let extras = { summary: agent.resultText.slice(0, 4000), memories: [] };
+    if (config.summary && !job.cancelled) {
+      try {
+        const s = await summarize(job, ws.dir);
+        usage = addUsage(usage, s.usage);
+        extras = { summary: s.summary || extras.summary, memories: s.memories };
+      } catch (err) {
+        log("system", `Summary skipped: ${err.message}`);
+      }
+    }
+    if (job.cancelled) return;
+
+    await flushLogs(job);
+    await apiWithRetry("POST", `/api/runner/tasks/${task.id}/complete`, {
+      runId,
+      usage,
+      ...published,
+      ...extras,
+    });
+    info(`+ Finished "${task.title}"${published.prUrl ? ` - ${published.prUrl}` : ""}`);
+  } catch (err) {
+    if (job.cancelled) return;
+    if (err instanceof ApiError && err.status === 409) {
+      info(`- "${task.title}" was stopped or reassigned on the board`);
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    log("system", `Error: ${message}`);
+    await flushLogs(job).catch(() => {});
+    await apiWithRetry("POST", `/api/runner/tasks/${task.id}/fail`, {
+      runId,
+      error: message.slice(0, 2000),
+      usage,
+    }).catch((e) => warn(`Could not report the failure to the board: ${e.message}`));
+    info(`x Failed "${task.title}": ${message.split("\n")[0]}`);
+  } finally {
+    clearInterval(heartbeatTimer);
+    if (job.cancelled && !shuttingDown) info(`- Stopped "${task.title}"`);
+    if (ws && !shuttingDown) await cleanupWorkspace(ws, log).catch(() => {});
+    clearInterval(flushTimer);
+    await flushLogs(job).catch(() => {});
+    jobs.delete(task.id);
+  }
+}
+
+// ── Startup ────────────────────────────────────────────────────────
+
+function checkTool(cmd, args, useShell) {
+  const res = IS_WINDOWS && useShell
+    ? spawnSync([winQuote(cmd), ...args].join(" "), { shell: true, encoding: "utf-8", env: childEnv(), windowsHide: true })
+    : spawnSync(cmd, args, { encoding: "utf-8", env: childEnv() });
+  return res.status === 0 ? (res.stdout || "").trim().split("\n")[0] : null;
+}
+
+async function shutdown(code) {
+  if (shuttingDown) process.exit(code); // second Ctrl+C: leave now
+  shuttingDown = true;
+  if (jobs.size > 0) {
+    info(`Stopping ${jobs.size} running task(s); the board will hand them to another agent...`);
+  }
+  await Promise.all(
+    [...jobs.values()].map(async (job) => {
+      job.cancelled = true;
+      killTree(job.child);
+      await api("POST", `/api/runner/tasks/${job.taskId}/fail`, {
+        runId: job.runId,
+        error: `Runner ${me.name} was shut down`,
+      }).catch(() => {});
+    })
+  );
+  process.exit(code);
+}
+
+async function main() {
+  if (flags.help) {
+    console.log(HELP);
+    return;
+  }
+  if (!config.server || !config.token) {
+    console.error(`Missing --server or --token.\n\n${HELP}`);
+    process.exit(1);
+  }
+  if (parseInt(process.versions.node, 10) < 18) {
+    console.error(`Node 18 or newer is required (you have ${process.versions.node}).`);
+    process.exit(1);
+  }
+
+  console.log(`AgentBoard runner ${VERSION}\n`);
+  if (config.permissionMode === "bypassPermissions") {
+    console.log(
+      "  Heads up: tasks run with Claude Code in bypassPermissions mode on THIS computer.\n" +
+        "  Anyone who can add tasks to this board can make it run commands here, so only\n" +
+        "  connect to boards run by people you trust. --permission-mode acceptEdits is safer.\n"
+    );
+  }
+
+  const claudeVersion = checkTool(config.claude, ["--version"], true);
+  if (!claudeVersion) {
+    console.error(`Could not run "${config.claude} --version". Install Claude Code and log in first, or pass --claude <path>.`);
+    process.exit(1);
+  }
+  if (!checkTool("git", ["--version"], false)) {
+    warn("git was not found. Tasks on boards with a git repo will fail.");
+  }
+  if (!checkTool("gh", ["--version"], false)) {
+    warn("GitHub CLI (gh) was not found. Branches will be pushed but PRs won't be opened automatically.");
+  }
+
+  try {
+    me = await api("GET", "/api/runner/me");
+  } catch (err) {
+    console.error(
+      err.status === 401
+        ? "The board rejected this token. Ask for a new one in the board's Agents panel."
+        : `Could not reach ${config.server}: ${err.message}`
+    );
+    process.exit(1);
+  }
+
+  fs.mkdirSync(config.workdir, { recursive: true });
+  saveConfig();
+
+  info(`Claude Code: ${claudeVersion}`);
+  info(`Connected to ${config.server} as "${me.name}"${me.owner ? ` (${me.owner})` : ""}`);
+  info(`Workspace: ${config.workdir}`);
+  info(`Waiting for tasks (up to ${config.concurrency} at a time). Press Ctrl+C to stop.`);
+
+  process.on("SIGINT", () => shutdown(0));
+  process.on("SIGTERM", () => shutdown(0));
+
+  let offline = false;
+  while (!shuttingDown) {
+    if (jobs.size < config.concurrency) {
+      try {
+        const claim = await api("POST", "/api/runner/claim", {
+          boardIds: config.boards,
+          concurrency: config.concurrency,
+          version: VERSION,
+          platform: `${process.platform}-${process.arch}`,
+        });
+        if (offline) {
+          info("Reconnected to the board");
+          offline = false;
+        }
+        if (claim) {
+          runJob(claim);
+          continue; // look for more work straight away
+        }
+      } catch (err) {
+        if (err.status === 401) {
+          warn("The board revoked this runner's token. Exiting.");
+          await shutdown(1);
+        }
+        if (!offline) {
+          warn(`Lost connection to the board (${err.message}). Retrying...`);
+          offline = true;
+        }
+      }
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

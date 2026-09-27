@@ -56,6 +56,10 @@ export function useEventSource() {
           if (data.type === "dispatcher:status") {
             queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
           }
+          if (data.type === "runners:updated") {
+            queryClient.invalidateQueries({ queryKey: ["runners"] });
+            queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
+          }
           if (data.type === "memory:updated") {
             queryClient.invalidateQueries({ queryKey: ["memory"] });
           }

@@ -27,6 +27,7 @@ export async function GET(request: Request) {
   const tasks = await prisma.task.findMany({
     where: { boardId },
     orderBy: [{ priority: "asc" }, { position: "asc" }, { createdAt: "asc" }],
+    omit: { diff: true }, // can be large; fetched on demand via /api/tasks/[id]/diff
   });
   return NextResponse.json(tasks);
 }

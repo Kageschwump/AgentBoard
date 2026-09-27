@@ -27,6 +27,7 @@ import {
   useRetryTask,
   useUpdateTask,
   useTasksQuery,
+  useDispatcherStatus,
 } from "@/hooks/useTasksQuery";
 import {
   PRIORITY_LABELS,
@@ -157,6 +158,8 @@ export function TaskCardDetail({
   const retryTask = useRetryTask();
   const updateTask = useUpdateTask();
   const { data: allTasks } = useTasksQuery();
+  const { data: queueStatus } = useDispatcherStatus();
+  const canMergePrs = !!queueStatus?.canMergePrs;
   const [diffOpen, setDiffOpen] = useState(false);
 
   const isEditable =
@@ -210,7 +213,14 @@ export function TaskCardDetail({
     updateTask.mutate(
       { id: task.id, status: "done" },
       {
-        onSuccess: () => toast.success(task.prUrl ? "Task approved & PR merged" : "Task approved"),
+        onSuccess: () =>
+          toast.success(
+            task.prUrl && canMergePrs
+              ? "Task approved & PR merged"
+              : task.prUrl
+                ? "Task approved. Merge the PR on GitHub."
+                : "Task approved"
+          ),
         onError: (err) => toast.error(err.message || "Failed to approve task"),
       }
     );
@@ -220,7 +230,8 @@ export function TaskCardDetail({
     updateTask.mutate(
       { id: task.id, status: "failed", error: "Rejected by user" },
       {
-        onSuccess: () => toast.success(task.prUrl ? "Task rejected & PR closed" : "Task rejected"),
+        onSuccess: () =>
+          toast.success(task.prUrl && canMergePrs ? "Task rejected & PR closed" : "Task rejected"),
         onError: () => toast.error("Failed to reject task"),
       }
     );
@@ -292,6 +303,11 @@ export function TaskCardDetail({
 
           {/* Timestamps */}
           <div className="space-y-1 text-xs text-muted-foreground">
+            {task.runnerName && (
+              <div>
+                Agent: <span className="text-foreground">{task.runnerName}</span>
+              </div>
+            )}
             <div>Created: {new Date(task.createdAt).toLocaleString()}</div>
             {task.startedAt && (
               <div>Started: {new Date(task.startedAt).toLocaleString()}</div>
@@ -362,16 +378,16 @@ export function TaskCardDetail({
             />
           </div>
 
-          {/* Working Directory */}
+          {/* Repository override */}
           <div>
             <h4 className="mb-1 text-xs font-medium text-muted-foreground">
-              Working Directory
+              Repository
             </h4>
             <EditableText
               value={task.repoUrl}
               onSave={(v) => handleUpdate("repoUrl", v)}
               disabled={!isEditable}
-              placeholder="Defaults to workspaces/<taskId>"
+              placeholder="Board's repo (git URL to override)"
               className="text-xs font-mono"
             />
           </div>
@@ -611,7 +627,7 @@ export function TaskCardDetail({
                   disabled={updateTask.isPending}
                   className="bg-green-600 hover:bg-green-700"
                 >
-                  {task.prUrl ? "Approve & Merge" : "Approve"}
+                  {task.prUrl && canMergePrs ? "Approve & Merge" : "Approve"}
                 </Button>
                 <Button
                   variant="destructive"
@@ -646,7 +662,7 @@ export function TaskCardDetail({
             {(task.status === TaskStatus.DONE ||
               task.status === TaskStatus.FAILED ||
               task.status === TaskStatus.REVIEW) &&
-              (task.repoUrl || task.worktreePath) && (
+              task.branchName && (
               <Button
                 variant="outline"
                 size="sm"

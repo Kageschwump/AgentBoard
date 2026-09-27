@@ -58,7 +58,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   const { data: skills = [] } = useSkillsQuery();
   const { data: boards = [] } = useBoardsQuery();
   const currentBoard = boards.find((b) => b.id === boardId);
-  const boardHasRepo = !!(currentBoard as { repoPath?: string })?.repoPath;
+  const boardHasRepo = !!currentBoard?.repoUrl;
 
   // Apply initial skill when provided
   useEffect(() => {
@@ -203,18 +203,18 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           {boardHasRepo ? (
             <div className="rounded-md bg-muted/30 p-3">
               <p className="text-xs text-muted-foreground">
-                This board is connected to a git repository. The agent will work on its own branch automatically.
+                This board is connected to a git repository. The agent will work on its own branch and open a PR.
               </p>
             </div>
           ) : (
             <div>
               <label className="mb-1 block text-sm font-medium">
-                Working Directory
+                Repository (optional)
               </label>
               <Input
                 value={repoUrl}
                 onChange={(e) => setRepoUrl(e.target.value)}
-                placeholder="Defaults to workspaces/<taskId> if empty"
+                placeholder="Git URL to clone. Empty = a scratch folder on the agent's machine"
               />
             </div>
           )}

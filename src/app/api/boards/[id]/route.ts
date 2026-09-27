@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { z } from "zod/v4";
-import { validateGitRepo } from "@/lib/git-operations";
 
 const updateBoardSchema = z.object({
   name: z.string().min(1).optional(),
   description: z.string().optional(),
-  repoPath: z.string().optional(),
+  repoUrl: z.string().trim().optional(),
   baseBranch: z.string().optional(),
   gitProvider: z.string().optional(),
 });
@@ -31,17 +30,6 @@ export async function PATCH(
   try {
     const body = await request.json();
     const data = updateBoardSchema.parse(body);
-
-    // Validate repoPath if being set
-    if (data.repoPath !== undefined && data.repoPath !== "") {
-      const validation = validateGitRepo(data.repoPath);
-      if (!validation.valid) {
-        return NextResponse.json(
-          { error: `Invalid git repository: ${validation.error}` },
-          { status: 400 }
-        );
-      }
-    }
 
     const board = await prisma.board.update({
       where: { id },

@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { getDispatcher } from "@/lib/dispatcher";
-import { emitEvent } from "@/lib/event-emitter";
+import { stopTask } from "@/lib/task-queue";
 
 export async function POST(
   _request: Request,
@@ -9,30 +8,14 @@ export async function POST(
 ) {
   const { id } = await params;
 
-  const task = await prisma.task.findUnique({ where: { id } });
-  if (!task) {
-    return NextResponse.json({ error: "Task not found" }, { status: 404 });
+  const stopped = await stopTask(id);
+  if (!stopped) {
+    const exists = await prisma.task.count({ where: { id } });
+    return exists
+      ? NextResponse.json({ error: "Task is not in progress" }, { status: 400 })
+      : NextResponse.json({ error: "Task not found" }, { status: 404 });
   }
 
-  if (task.status !== "in_progress") {
-    return NextResponse.json(
-      { error: "Task is not in progress" },
-      { status: 400 }
-    );
-  }
-
-  const dispatcher = getDispatcher();
-  dispatcher.stopTask(id);
-
-  const updated = await prisma.task.update({
-    where: { id },
-    data: {
-      status: "failed",
-      error: "Manually stopped",
-      agentPid: null,
-    },
-  });
-
-  emitEvent({ type: "task:updated", taskId: id });
+  const updated = await prisma.task.findUnique({ where: { id } });
   return NextResponse.json(updated);
 }

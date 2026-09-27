@@ -120,6 +120,15 @@ export function TaskCard({ task }: TaskCardProps) {
             </span>
           )}
 
+          {task.runnerName && task.status !== TaskStatus.TODO && task.status !== TaskStatus.READY && (
+            <span
+              className="min-w-0 truncate text-[10px] text-muted-foreground"
+              title={`Agent: ${task.runnerName}`}
+            >
+              by {task.runnerName}
+            </span>
+          )}
+
           {task.status === TaskStatus.FAILED && task.error && (
             <span className="truncate text-[10px] text-red-400">
               {task.error}

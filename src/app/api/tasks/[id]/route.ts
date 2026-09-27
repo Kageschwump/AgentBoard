@@ -2,12 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { emitEvent } from "@/lib/event-emitter";
 import { z } from "zod/v4";
-import {
-  mergePullRequest,
-  closePullRequest,
-  cleanupWorktree,
-  detectProvider,
-} from "@/lib/git-operations";
+import { mergeGitHubPr, closeGitHubPr } from "@/lib/github";
 
 const updateTaskSchema = z.object({
   title: z.string().min(1).optional(),
@@ -58,50 +53,25 @@ export async function PATCH(
       return NextResponse.json({ error: "Task not found" }, { status: 404 });
     }
 
-    // Handle approval transition: review → done (merge PR)
+    // Handle approval transition: review → done (merge PR if this server can)
     if (currentTask.status === "review" && rest.status === "done" && currentTask.prUrl) {
-      const board = await prisma.board.findUnique({
-        where: { id: currentTask.boardId },
-        select: { repoPath: true, gitProvider: true },
-      });
-      if (board?.repoPath) {
-        try {
-          const provider = detectProvider(board.repoPath, board.gitProvider || undefined);
-          mergePullRequest(currentTask.prUrl, board.repoPath, provider);
-          // Clean up worktree after successful merge
-          if (currentTask.worktreePath) {
-            cleanupWorktree(board.repoPath, currentTask.worktreePath, currentTask.branchName || undefined);
-          }
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : "Merge failed";
-          return NextResponse.json(
-            { error: `PR merge failed: ${errMsg}. Resolve conflicts on GitHub first.` },
-            { status: 409 }
-          );
-        }
+      try {
+        await mergeGitHubPr(currentTask.prUrl, currentTask.branchName);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : "Merge failed";
+        return NextResponse.json(
+          { error: `PR merge failed: ${errMsg}. Resolve it on GitHub first.` },
+          { status: 409 }
+        );
       }
     }
 
     // Handle rejection transition: review → failed (close PR)
     if (currentTask.status === "review" && rest.status === "failed" && currentTask.prUrl) {
-      const board = await prisma.board.findUnique({
-        where: { id: currentTask.boardId },
-        select: { repoPath: true, gitProvider: true },
-      });
-      if (board?.repoPath) {
-        const provider = detectProvider(board.repoPath, board.gitProvider || undefined);
-        try {
-          closePullRequest(currentTask.prUrl, board.repoPath, provider);
-        } catch {
-          // Best-effort: PR close failure shouldn't block rejection
-        }
-        if (currentTask.worktreePath) {
-          try {
-            cleanupWorktree(board.repoPath, currentTask.worktreePath, currentTask.branchName || undefined);
-          } catch {
-            // Best-effort cleanup
-          }
-        }
+      try {
+        await closeGitHubPr(currentTask.prUrl, currentTask.branchName);
+      } catch {
+        // Best-effort: PR close failure shouldn't block rejection
       }
     }
 

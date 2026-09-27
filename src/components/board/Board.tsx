@@ -8,7 +8,8 @@ import {
 import { Column } from "./Column";
 import { BoardSelector } from "./BoardSelector";
 import { CreateTaskForm } from "../forms/CreateTaskForm";
-import { DispatcherToggle } from "./DispatcherToggle";
+import { QueueControls } from "./QueueControls";
+import { AgentsPanel } from "./AgentsPanel";
 import { NotificationToggle } from "./NotificationToggle";
 import { BoardStats } from "./BoardStats";
 import { SearchBar } from "./SearchBar";
@@ -23,6 +24,7 @@ import {
   useUpdateTask,
   useClearDoneTasks,
   useDispatcherStatus,
+  useToggleQueue,
 } from "@/hooks/useTasksQuery";
 import { useEventSource } from "@/hooks/useEventSource";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
@@ -51,6 +53,7 @@ export function Board() {
   const updateTask = useUpdateTask();
   const clearDoneTasks = useClearDoneTasks();
   const { data: dispatcherStatus } = useDispatcherStatus();
+  const toggleQueue = useToggleQueue();
 
   // Search & filter state
   const [search, setSearch] = useState("");
@@ -65,6 +68,7 @@ export function Board() {
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null);
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
+  const [agentsOpen, setAgentsOpen] = useState(false);
 
   const handleUseSkill = useCallback((skill: Skill) => {
     setSelectedSkill(skill);
@@ -210,21 +214,17 @@ export function Board() {
     [queryClient]
   );
 
+  const handleLogout = useCallback(async () => {
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+    window.location.href = "/login";
+  }, []);
+
   // Keyboard shortcuts
-  const handleToggleDispatcher = useCallback(async () => {
-    try {
-      const res = await fetch("/api/dispatcher", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: dispatcherStatus?.running ? "stop" : "start",
-        }),
-      });
-      if (!res.ok) throw new Error("Failed to toggle dispatcher");
-    } catch {
-      // silently ignore
-    }
-  }, [dispatcherStatus?.running]);
+  const { mutate: setQueueRunning } = toggleQueue;
+  const handleToggleDispatcher = useCallback(() => {
+    if (!dispatcherStatus) return;
+    setQueueRunning(!dispatcherStatus.running);
+  }, [dispatcherStatus, setQueueRunning]);
 
   const shortcutHandlers = useMemo(
     () => ({
@@ -306,7 +306,7 @@ export function Board() {
           >
             Integrations
           </Button>
-          <DispatcherToggle />
+          <QueueControls onOpenAgents={() => setAgentsOpen(true)} />
           <CreateTaskForm
             boardId={boardId}
             externalOpen={createFormOpen}
@@ -316,6 +316,11 @@ export function Board() {
             }}
             initialSkill={selectedSkill}
           />
+          {dispatcherStatus?.authEnabled && (
+            <Button variant="ghost" size="sm" onClick={handleLogout}>
+              Log out
+            </Button>
+          )}
         </div>
       </header>
 
@@ -333,6 +338,7 @@ export function Board() {
 
       <ShortcutsHelp open={shortcutsHelpOpen} onOpenChange={setShortcutsHelpOpen} />
       <IntegrationsPanel open={integrationsOpen} onOpenChange={setIntegrationsOpen} />
+      <AgentsPanel open={agentsOpen} onOpenChange={setAgentsOpen} />
       <MemoryPanel boardId={boardId} open={memoryOpen} onOpenChange={setMemoryOpen} />
       <SkillsLibrary open={skillsOpen} onOpenChange={setSkillsOpen} onUseSkill={handleUseSkill} />
 
