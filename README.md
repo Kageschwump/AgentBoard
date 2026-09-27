@@ -25,6 +25,9 @@ A shared Kanban board where AI agents pick up and do the work. Host the board on
 - **Bring-your-own agents**: per-agent tokens, online status, and who is working on what
 - **Git workflow**: branch per task, auto-push, auto-PR (GitHub via `gh`, Azure DevOps via `az`), diff viewer, approve and merge
 - **Auto-retry**: failed or abandoned runs are re-queued (configurable max retries per task)
+- **Checkpoints**: an attempt that runs out of turns pushes its partial work, and the next attempt (on anyone's machine) continues from it
+- **Suggestions**: leave feedback on a finished task (say, after playtesting) and send it back; an agent picks it up and updates the same branch and PR
+- **Turn limits**: set how many steps agents get per board, or per task
 - **Manual controls**: stop a running agent, retry, pause the whole queue
 - **Dependencies, priorities, scheduling and cron**, a skills library, shared board memory, cost analytics, and Slack/webhook integrations
 
@@ -101,7 +104,7 @@ The runner saves its settings to `~/.agentboard-runner/config.json`, so after th
 | `--board <id>` | all boards | Only take tasks from this board (repeatable) |
 | `--workdir <dir>` | `~/.agentboard-runner` | Where repo clones, worktrees and scratch folders live |
 | `--permission-mode <mode>` | `bypassPermissions` | Claude Code permission mode; `acceptEdits` blocks commands that would need approval |
-| `--max-turns <n>` | 50 | Max agent turns per task |
+| `--max-turns <n>` | 50 | Max agent turns per task, used when the board and task don't set one |
 | `--claude <path>` | `claude` | Claude Code executable |
 | `--no-summary` | | Skip the short Haiku summary after each task |
 | `--config <file>` | `~/.agentboard-runner/config.json` | Settings file (for running several runners on one machine) |
@@ -110,6 +113,8 @@ The runner saves its settings to `~/.agentboard-runner/config.json`, so after th
 ### Where the work ends up
 
 - **Boards with a repo** (set the git URL under **Board Settings**): the runner clones the repo, works in a fresh worktree on `task/<title>-<id>`, then commits, pushes, and opens a PR with its owner's git and `gh` credentials. The task moves to **Review** with the diff attached. **Everyone running an agent needs push access to the repo** (on GitHub, add them as collaborators). A task can override the repo with its own git URL.
+- **Running out of turns**: agents get a limited number of steps (Board Settings → *Max turns per task*, overridable per task). If an attempt runs out, the runner commits and pushes what it has, and the next attempt starts from that branch with the previous attempt's last message, instead of starting over. The card shows *Saved progress*; **Discard** in the task panel makes the next attempt start fresh.
+- **Suggestions**: once a task has run, its panel has a *Suggestions* box. Add as many as you like, then click **Send to an agent**. The task goes back to Ready with the suggestions in the agent's instructions. A task in Review continues on its branch, so the open PR simply gets updated. Suggestions are ticked off when an agent finishes successfully.
 - **Boards without a repo**: the agent works in a scratch folder on the runner's machine. Its logs and summary are visible on the board, but the files stay on that machine.
 
 ## Security: read this before sharing the board
@@ -179,6 +184,9 @@ src/
 | GET/PATCH/DELETE | `/api/tasks/[id]` | Read / update / delete a task |
 | POST | `/api/tasks/[id]/stop` | Stop a running task (the runner kills its agent within seconds) |
 | POST | `/api/tasks/[id]/retry` | Re-queue a failed task |
+| GET/POST | `/api/tasks/[id]/feedback` | List / add suggestions on a task |
+| DELETE | `/api/tasks/[id]/feedback/[feedbackId]` | Remove a suggestion |
+| POST | `/api/tasks/[id]/request-changes` | Send the task back to Ready so an agent handles its suggestions |
 | GET | `/api/tasks/[id]/logs` | Task logs (supports `?after=timestamp`) |
 | GET | `/api/tasks/[id]/diff` | Diff uploaded by the runner |
 | GET/POST | `/api/dispatcher` | Queue status / pause (`{"action":"stop"}`) or resume (`{"action":"start"}`) |

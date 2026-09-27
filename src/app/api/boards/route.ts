@@ -9,6 +9,7 @@ const createBoardSchema = z.object({
   repoUrl: z.string().trim().optional().default(""),
   baseBranch: z.string().optional().default("main"),
   gitProvider: z.string().optional().default(""),
+  maxTurns: z.number().int().min(0).max(1000).optional().default(0),
 });
 
 export async function GET() {

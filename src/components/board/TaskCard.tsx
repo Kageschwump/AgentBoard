@@ -96,6 +96,16 @@ export function TaskCard({ task }: TaskCardProps) {
             </Badge>
           )}
 
+          {task.resumeNote && task.status !== TaskStatus.DONE && (
+            <Badge
+              variant="outline"
+              className="text-[10px] border-blue-500/30 bg-blue-500/10 text-blue-400"
+              title="An earlier attempt ran out of turns; the next one continues from its progress"
+            >
+              Saved progress
+            </Badge>
+          )}
+
           {task.scheduledFor && (
             <Badge variant="outline" className="text-[10px] border-blue-500/30 bg-blue-500/10 text-blue-400">
               Scheduled

@@ -48,6 +48,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   const [tags, setTags] = useState("");
   const [dependsOn, setDependsOn] = useState("");
   const [model, setModel] = useState("");
+  const [maxTurns, setMaxTurns] = useState("");
   const [requireApproval, setRequireApproval] = useState(false);
   const [showSchedule, setShowSchedule] = useState(false);
   const [scheduledFor, setScheduledFor] = useState("");
@@ -109,6 +110,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
         tags: finalTags,
         dependsOn: dependsOnJson,
         model: model === "default" ? "" : model,
+        maxTurns: parseInt(maxTurns, 10) || 0,
         boardId,
         ...(scheduledFor && { scheduledFor }),
         ...(cronExpression && { cronExpression }),
@@ -125,6 +127,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           setTags("");
           setDependsOn("");
           setModel("");
+          setMaxTurns("");
           setRequireApproval(false);
           setShowSchedule(false);
           setScheduledFor("");
@@ -239,7 +242,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             <div>
               <label className="mb-1 block text-sm font-medium">Priority</label>
               <Select value={priority} onValueChange={setPriority}>
@@ -267,6 +270,19 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
                   <SelectItem value="haiku">Haiku</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+
+            <div>
+              <label className="mb-1 block text-sm font-medium">Max turns</label>
+              <Input
+                type="number"
+                min={0}
+                max={1000}
+                value={maxTurns}
+                onChange={(e) => setMaxTurns(e.target.value)}
+                placeholder="Board default"
+                title="How many steps the agent gets before it stops and saves its progress"
+              />
             </div>
           </div>
 

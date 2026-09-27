@@ -8,6 +8,13 @@ const failSchema = z.object({
   runId: z.string().min(1),
   error: z.string().min(1).max(2000),
   usage: usageSchema.optional(),
+  checkpoint: z
+    .object({
+      branchName: z.string().max(250).optional().default(""),
+      note: z.string().max(4000).optional().default(""),
+      diff: z.string().optional().default(""),
+    })
+    .optional(),
 });
 
 export async function POST(
@@ -22,9 +29,9 @@ export async function POST(
   if (!parsed.success) {
     return NextResponse.json({ error: "Invalid failure report" }, { status: 400 });
   }
-  const { runId, error, usage } = parsed.data;
+  const { runId, error, usage, checkpoint } = parsed.data;
 
-  const ok = await failRun(auth.runner, id, runId, error, usage);
+  const ok = await failRun(auth.runner, id, runId, error, usage, checkpoint);
   if (!ok) {
     return NextResponse.json({ error: "Run is no longer active" }, { status: 409 });
   }

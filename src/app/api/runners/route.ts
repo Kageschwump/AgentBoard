@@ -4,6 +4,7 @@ import { prisma } from "@/lib/db";
 import { generateRunnerToken, hashRunnerToken } from "@/lib/auth";
 import { isRunnerOnline } from "@/lib/runner-auth";
 import { emitEvent } from "@/lib/event-emitter";
+import { getLatestRunnerVersion } from "@/lib/runner-version";
 
 const createRunnerSchema = z.object({
   name: z.string().trim().min(1, "Name is required").max(60),
@@ -11,6 +12,7 @@ const createRunnerSchema = z.object({
 });
 
 export async function GET() {
+  const latestVersion = await getLatestRunnerVersion();
   const runners = await prisma.runner.findMany({
     orderBy: { createdAt: "asc" },
     include: {
@@ -33,6 +35,7 @@ export async function GET() {
       concurrency: runner.concurrency,
       createdAt: runner.createdAt,
       online: isRunnerOnline(runner.lastSeenAt),
+      outdated: !!runner.version && !!latestVersion && runner.version !== latestVersion,
       activeTasks: runner.tasks,
     }))
   );

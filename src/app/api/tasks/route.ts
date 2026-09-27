@@ -17,6 +17,7 @@ const createTaskSchema = z.object({
   scheduledFor: z.string().optional(),
   cronExpression: z.string().optional().default(""),
   recurring: z.boolean().optional().default(false),
+  maxTurns: z.number().int().min(0).max(1000).optional().default(0),
 });
 
 export async function GET(request: Request) {

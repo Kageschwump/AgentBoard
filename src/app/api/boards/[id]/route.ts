@@ -8,6 +8,7 @@ const updateBoardSchema = z.object({
   repoUrl: z.string().trim().optional(),
   baseBranch: z.string().optional(),
   gitProvider: z.string().optional(),
+  maxTurns: z.number().int().min(0).max(1000).optional(),
 });
 
 export async function GET(

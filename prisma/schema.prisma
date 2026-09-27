@@ -38,6 +38,10 @@ model Task {
   branchName   String   @default("") // git branch for this task
   prUrl        String   @default("") // pull request URL
   diff         String   @default("") // diff uploaded by the runner when the task finished
+  // Checkpoint left by an attempt that ran out of turns; the next attempt continues from it
+  resumeBranch String   @default("") // pushed branch holding the partial work ("" = start fresh)
+  resumeNote   String   @default("") // last message from that attempt
+  maxTurns     Int      @default(0) // agent turn limit; 0 = board default
   // Remote runner fields
   runnerId     String?            // runner currently (or last) working on this task
   runnerName   String   @default("") // denormalized so history survives runner deletion
@@ -46,12 +50,26 @@ model Task {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  board  Board   @relation(fields: [boardId], references: [id])
-  runner Runner? @relation(fields: [runnerId], references: [id], onDelete: SetNull)
-  logs   TaskLog[]
+  board    Board      @relation(fields: [boardId], references: [id])
+  runner   Runner?    @relation(fields: [runnerId], references: [id], onDelete: SetNull)
+  logs     TaskLog[]
+  feedback Feedback[]
 
   @@index([boardId])
   @@index([status])
+}
+
+// Suggestions left on a task (e.g. after playtesting) for an agent to address
+model Feedback {
+  id          String    @id @default(cuid())
+  taskId      String
+  content     String
+  addressedAt DateTime? // set when an agent run that included it finished successfully
+  createdAt   DateTime  @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
 }
 
 model Runner {
@@ -76,6 +94,7 @@ model Board {
   repoUrl     String   @default("") // git clone URL; runners check it out per task
   baseBranch  String   @default("main") // base branch for PRs
   gitProvider String   @default("") // "" = auto-detect, "github", "azuredevops"
+  maxTurns    Int      @default(0) // default agent turn limit for tasks; 0 = the runner's default
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 

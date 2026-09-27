@@ -38,6 +38,17 @@ export interface ClaimPayload {
   /** Task description, acceptance criteria and board knowledge, ready for the agent */
   instructions: string;
   repo: { url: string; baseBranch: string; gitProvider: string } | null;
+  /** Agent turn limit from the task or board; null = the runner's own default */
+  maxTurns: number | null;
+  /** Progress saved by an earlier attempt that ran out of turns */
+  resume: { branch: string; note: string } | null;
+}
+
+/** Partial work saved by an attempt that ran out of turns */
+export interface Checkpoint {
+  branchName: string;
+  note: string;
+  diff: string;
 }
 
 export interface RunResult {
@@ -91,6 +102,17 @@ async function buildInstructions(task: Task): Promise<string> {
   }
   if (task.criteria) {
     prompt += `\n\nAcceptance Criteria:\n${task.criteria}`;
+  }
+
+  const feedback = await prisma.feedback.findMany({
+    where: { taskId: task.id, addressedAt: null },
+    orderBy: { createdAt: "asc" },
+  });
+  if (feedback.length > 0) {
+    const items = feedback.map((f) => `- ${f.content.trim().replace(/\n/g, "\n  ")}`).join("\n");
+    prompt +=
+      `\n\n## Changes requested\nThis task has been worked on before. People reviewing or playtesting ` +
+      `the result left these suggestions. Build on the existing work and address every one:\n${items}`;
   }
 
   try {
@@ -175,6 +197,11 @@ export async function claimTask(
             gitProvider: board?.gitProvider || "",
           }
         : null,
+      maxTurns: task.maxTurns || board?.maxTurns || null,
+      resume:
+        task.resumeBranch || task.resumeNote
+          ? { branch: task.resumeBranch, note: task.resumeNote }
+          : null,
     };
   }
 
@@ -246,11 +273,21 @@ export async function completeRun(
       branchName: result.branchName,
       prUrl: result.prUrl,
       diff: result.diff.slice(0, MAX_DIFF_CHARS),
+      resumeBranch: "",
+      resumeNote: "",
       ...(result.summary && { summary: result.summary }),
       ...usageIncrement(result.usage),
     },
   });
   if (count === 0) return false; // stopped while we were looking
+
+  // Suggestions that were in this run's instructions are now handled
+  if (task.startedAt) {
+    await prisma.feedback.updateMany({
+      where: { taskId, addressedAt: null, createdAt: { lte: task.startedAt } },
+      data: { addressedAt: new Date() },
+    });
+  }
 
   if (result.memories.length > 0) {
     for (const mem of result.memories.slice(0, MAX_MEMORIES_PER_RUN)) {
@@ -287,7 +324,8 @@ export async function completeRun(
 async function failActiveRun(
   where: { id: string; runId: string; runnerId?: string },
   error: string,
-  usage?: RunUsage
+  usage?: RunUsage,
+  checkpoint?: Checkpoint
 ): Promise<boolean> {
   const task = await prisma.task.findFirst({ where: { ...where, status: "in_progress" } });
   if (!task) return false;
@@ -301,9 +339,26 @@ async function failActiveRun(
       heartbeatAt: null,
       ...(willRetry && { retryCount: { increment: 1 } }),
       ...usageIncrement(usage),
+      // Without a new checkpoint, any earlier one stays for the next attempt
+      // A non-empty note is what marks an out-of-turns checkpoint (vs. a send-back)
+      ...(checkpoint && {
+        resumeNote: checkpoint.note.trim() || "(The previous attempt didn't leave a message.)",
+        ...(checkpoint.branchName && {
+          resumeBranch: checkpoint.branchName,
+          branchName: checkpoint.branchName,
+          diff: checkpoint.diff.slice(0, MAX_DIFF_CHARS),
+        }),
+      }),
     },
   });
   if (count === 0) return false;
+
+  if (checkpoint?.branchName) {
+    await writeSystemLog(
+      task.id,
+      `Progress saved to ${checkpoint.branchName}. The next attempt continues from there.`
+    );
+  }
 
   await writeSystemLog(
     task.id,
@@ -332,9 +387,10 @@ export function failRun(
   taskId: string,
   runId: string,
   error: string,
-  usage?: RunUsage
+  usage?: RunUsage,
+  checkpoint?: Checkpoint
 ): Promise<boolean> {
-  return failActiveRun({ id: taskId, runId, runnerId: runner.id }, error, usage);
+  return failActiveRun({ id: taskId, runId, runnerId: runner.id }, error, usage, checkpoint);
 }
 
 /** Fail every run a runner currently holds (used when its token is revoked) */
@@ -364,6 +420,47 @@ export async function reapStaleRuns() {
       `Lost contact with ${task.runnerName || "the runner"} (no heartbeat for ${HEARTBEAT_TIMEOUT_MS / 1000}s)`
     );
   }
+}
+
+/**
+ * Send a worked-on task back to the queue so an agent handles its pending suggestions.
+ * A task in Review keeps building on its branch (updating the open PR); a merged or
+ * failed task starts from the base branch.
+ */
+export async function requestChanges(
+  taskId: string
+): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
+  const task = await prisma.task.findUnique({ where: { id: taskId } });
+  if (!task) return { ok: false, error: "Task not found", status: 404 };
+  if (task.status === "in_progress") {
+    return { ok: false, error: "An agent is already working on this task", status: 400 };
+  }
+
+  const pending = await prisma.feedback.count({ where: { taskId, addressedAt: null } });
+  if (pending === 0) {
+    return { ok: false, error: "Add a suggestion first", status: 400 };
+  }
+
+  const { count } = await prisma.task.updateMany({
+    where: { id: taskId, status: { not: "in_progress" } },
+    data: {
+      status: "ready",
+      error: null,
+      retryCount: 0,
+      completedAt: null,
+      ...(task.status === "review" && task.branchName && { resumeBranch: task.branchName }),
+    },
+  });
+  if (count === 0) {
+    return { ok: false, error: "An agent is already working on this task", status: 400 };
+  }
+
+  await writeSystemLog(
+    taskId,
+    `Sent back to the agents with ${pending} suggestion${pending === 1 ? "" : "s"}`
+  );
+  emitEvent({ type: "task:updated", taskId });
+  return { ok: true };
 }
 
 /** Stop a running task from the UI; the runner kills the agent on its next heartbeat */

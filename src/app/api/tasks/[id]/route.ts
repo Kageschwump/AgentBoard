@@ -24,6 +24,10 @@ const updateTaskSchema = z.object({
   scheduledFor: z.string().nullable().optional(),
   cronExpression: z.string().optional(),
   recurring: z.boolean().optional(),
+  maxTurns: z.number().int().min(0).max(1000).optional(),
+  // Only clearing is allowed: discards saved progress so the next attempt starts fresh
+  resumeBranch: z.literal("").optional(),
+  resumeNote: z.literal("").optional(),
 });
 
 export async function GET(
@@ -66,12 +70,16 @@ export async function PATCH(
       }
     }
 
-    // Handle rejection transition: review → failed (close PR)
-    if (currentTask.status === "review" && rest.status === "failed" && currentTask.prUrl) {
-      try {
-        await closeGitHubPr(currentTask.prUrl, currentTask.branchName);
-      } catch {
-        // Best-effort: PR close failure shouldn't block rejection
+    // Handle rejection transition: review → failed (close PR, start fresh next time)
+    if (currentTask.status === "review" && rest.status === "failed") {
+      rest.resumeBranch = "";
+      rest.resumeNote = "";
+      if (currentTask.prUrl) {
+        try {
+          await closeGitHubPr(currentTask.prUrl, currentTask.branchName);
+        } catch {
+          // Best-effort: PR close failure shouldn't block rejection
+        }
       }
     }
 

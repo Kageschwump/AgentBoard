@@ -111,6 +111,14 @@ function RunnerRow({ runner }: { runner: RunnerInfo }) {
             {runner.owner && (
               <span className="truncate text-xs text-muted-foreground">{runner.owner}</span>
             )}
+            {runner.outdated && (
+              <span
+                className="shrink-0 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-400"
+                title="Download the runner script again and restart it"
+              >
+                update runner
+              </span>
+            )}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
             {runner.online ? "Online" : `Last seen ${timeAgo(runner.lastSeenAt)}`}

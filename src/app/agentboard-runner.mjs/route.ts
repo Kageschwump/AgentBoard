@@ -1,12 +1,9 @@
 import { readFile } from "fs/promises";
-import path from "path";
+import { RUNNER_SCRIPT_PATH } from "@/lib/runner-version";
 
 /** Serve the runner script so friends can download it straight from the board */
 export async function GET() {
-  const script = await readFile(
-    path.join(process.cwd(), "runner", "agentboard-runner.mjs"),
-    "utf-8"
-  );
+  const script = await readFile(RUNNER_SCRIPT_PATH, "utf-8");
   return new Response(script, {
     headers: {
       "Content-Type": "text/javascript; charset=utf-8",

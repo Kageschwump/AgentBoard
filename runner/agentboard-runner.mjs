@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const POLL_INTERVAL_MS = 5_000;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const LOG_FLUSH_INTERVAL_MS = 1_000;
@@ -42,7 +42,7 @@ Options:
   --claude <path>            Claude Code executable (default "claude")
   --permission-mode <mode>   Claude permission mode (default bypassPermissions;
                              acceptEdits blocks commands that would need approval)
-  --max-turns <n>            Max agent turns per task (default 50)
+  --max-turns <n>            Max agent turns per task when the board doesn't set one (default 50)
   --no-summary               Skip the post-task summary (saves a small Haiku call)
   --config <file>            Settings file (default ~/.agentboard-runner/config.json)
   -v, --verbose              Print all agent output, not just progress
@@ -308,7 +308,6 @@ async function prepareWorkspace(claim, log) {
   }
 
   const repoDir = path.join(config.workdir, "repos", repoDirName(repo.url));
-  const branchName = `task/${slugify(task.title) || "task"}-${task.id.slice(-8)}`;
   const dir = path.join(config.workdir, "worktrees", task.id);
 
   return withRepoLock(repoDir, async () => {
@@ -324,6 +323,28 @@ async function prepareWorkspace(claim, log) {
       }
     }
 
+    const baseRef = await firstExistingRef(repoDir, [
+      `origin/${repo.baseBranch}`,
+      repo.baseBranch,
+      "HEAD",
+    ]);
+    const baseSha = (await git(["rev-parse", `${baseRef}^{commit}`], repoDir)).trim();
+
+    // Continue from progress an earlier attempt pushed, if it's still there
+    let branchName = `task/${slugify(task.title) || "task"}-${task.id.slice(-8)}`;
+    let startPoint = baseRef;
+    let resumed = false;
+    if (claim.resume?.branch) {
+      try {
+        await git(["rev-parse", "--verify", "--quiet", `origin/${claim.resume.branch}^{commit}`], repoDir);
+        branchName = claim.resume.branch;
+        startPoint = `origin/${claim.resume.branch}`;
+        resumed = true;
+      } catch {
+        log("system", `Saved progress (${claim.resume.branch}) is no longer on the remote, starting fresh`);
+      }
+    }
+
     // Clear leftovers from an earlier attempt at this task
     await git(["worktree", "prune"], repoDir).catch(() => {});
     if (fs.existsSync(dir)) {
@@ -332,16 +353,17 @@ async function prepareWorkspace(claim, log) {
     }
     await git(["branch", "-D", branchName], repoDir).catch(() => {});
 
-    const startPoint = await firstExistingRef(repoDir, [
-      `origin/${repo.baseBranch}`,
-      repo.baseBranch,
-      "HEAD",
-    ]);
     await git(["worktree", "add", "-b", branchName, dir, startPoint], repoDir);
-    const baseCommit = (await git(["rev-parse", "HEAD"], dir)).trim();
-    log("system", `Working on branch ${branchName} (from ${startPoint})`);
+    // Diffs and PRs compare against the base branch, so they include earlier attempts' commits
+    const baseCommit = (await git(["merge-base", "HEAD", baseSha], dir)).trim();
+    log(
+      "system",
+      resumed
+        ? `Continuing existing work on ${branchName}`
+        : `Working on branch ${branchName} (from ${startPoint})`
+    );
 
-    return { dir, repo, repoDir, branchName, baseCommit, keep: false };
+    return { dir, repo, repoDir, branchName, baseCommit, resumed, keep: false };
   });
 }
 
@@ -394,11 +416,11 @@ async function openPullRequest(claim, ws) {
   return out.trim().split("\n").pop() || "";
 }
 
-/** Commit whatever the agent changed, push the branch and open a PR */
-async function publishChanges(claim, ws, log) {
-  const { task, repo } = claim;
-  const noChanges = { branchName: "", prUrl: "", pushed: false, diff: "" };
-
+/**
+ * Commit whatever the agent changed and push the task branch.
+ * Returns the diff against the base branch, or null if there's nothing to push.
+ */
+async function commitAndPush(ws, message, log) {
   await git(["add", "-A"], ws.dir);
   const status = (await git(["status", "--porcelain"], ws.dir)).trim();
   if (status) {
@@ -406,14 +428,11 @@ async function publishChanges(claim, ws, log) {
     const identity = hasIdentity
       ? []
       : ["-c", "user.name=AgentBoard Runner", "-c", "user.email=agentboard-runner@users.noreply.github.com"];
-    await git([...identity, "commit", "-m", `[AgentBoard] ${task.title}`], ws.dir);
+    await git([...identity, "commit", "-m", message], ws.dir);
   }
 
   const ahead = parseInt((await git(["rev-list", "--count", `${ws.baseCommit}..HEAD`], ws.dir)).trim(), 10);
-  if (!ahead) {
-    log("system", "No file changes to publish");
-    return noChanges;
-  }
+  if (!ahead) return null;
 
   ws.keep = true; // committed but not pushed yet: don't delete it if the push fails
   let diff = await git(["diff", `${ws.baseCommit}..HEAD`], ws.dir, 60_000).catch(() => "");
@@ -422,9 +441,35 @@ async function publishChanges(claim, ws, log) {
   }
 
   log("system", `Pushing ${ws.branchName}`);
-  // The branch belongs to this task; a retry replaces the previous attempt
+  // The branch belongs to this task; a fresh retry replaces the previous attempt
   await git(["push", "--force", "-u", "origin", ws.branchName], ws.dir, 5 * 60_000);
   ws.keep = false;
+  return diff;
+}
+
+/** Save an out-of-turns attempt's work so the next attempt can pick it up */
+async function saveCheckpoint(claim, ws, job, log) {
+  const checkpoint = { branchName: "", note: (job.lastText || "").slice(-2000), diff: "" };
+  if (!ws.repo) return checkpoint;
+  try {
+    log("system", "Saving progress for the next attempt");
+    const diff = await commitAndPush(ws, `[AgentBoard] WIP: ${claim.task.title} (ran out of turns)`, log);
+    if (diff !== null) Object.assign(checkpoint, { branchName: ws.branchName, diff });
+  } catch (err) {
+    log("system", `Could not save progress: ${err.message}`);
+  }
+  return checkpoint;
+}
+
+/** Commit whatever the agent changed, push the branch and open a PR */
+async function publishChanges(claim, ws, log) {
+  const { task, repo } = claim;
+
+  const diff = await commitAndPush(ws, `[AgentBoard] ${task.title}`, log);
+  if (diff === null) {
+    log("system", "No file changes to publish");
+    return { branchName: "", prUrl: "", pushed: false, diff: "" };
+  }
 
   let prUrl = "";
   try {
@@ -465,8 +510,36 @@ Work in the current directory: ${ws.dir}`;
     prompt += `\nDo NOT commit or push changes. The runner handles git automatically.`;
   }
   prompt += `\n\n${claim.instructions}`;
+  if (claim.resume) prompt += resumeInstructions(claim, ws);
   prompt += `\n\nDo not ask clarifying questions. Execute the task to completion.`;
   return prompt;
+}
+
+function resumeInstructions(claim, ws) {
+  const reviewHint = () => {
+    const base = ws.baseCommit.slice(0, 12);
+    return ` Start by reviewing it (\`git log --oneline ${base}..HEAD\` and \`git diff ${base}\`).`;
+  };
+
+  // Sent back with suggestions: earlier finished work is on the branch
+  if (!claim.resume.note) {
+    return ws.resumed
+      ? `\n\n## Existing work\nEarlier work on this task is already on this branch.${reviewHint()} Build on it rather than starting over.`
+      : "";
+  }
+
+  // An earlier attempt ran out of turns
+  let text = `\n\n## Continuing earlier work\nA previous attempt at this task ran out of turns before finishing.`;
+  if (ws.resumed) {
+    text += ` Its work so far is already on this branch.${reviewHint()} Then carry on from where it stopped instead of starting over.`;
+  } else if (!ws.repo) {
+    text += ` Anything it created may already be in the current directory; check before starting over.`;
+  } else {
+    text += ` Its changes aren't available, but use what it said to avoid repeating dead ends.`;
+  }
+  text += `\n\nIts last message was:\n> ${claim.resume.note.trim().replace(/\n/g, "\n> ")}`;
+  text += `\n\nTurns are limited, so focus on finishing the remaining work.`;
+  return text;
 }
 
 function usageFromResult(result) {
@@ -502,11 +575,11 @@ function claudeArgs(model, extra) {
 }
 
 /** Run the agent, streaming its output to the board */
-function runClaude(job, prompt, cwd, model, log) {
+function runClaude(job, prompt, cwd, model, maxTurns, log) {
   return new Promise((resolve) => {
     const args = claudeArgs(model, [
       "--output-format", "stream-json", "--verbose",
-      "--max-turns", String(config.maxTurns),
+      "--max-turns", String(maxTurns),
       "--permission-mode", config.permissionMode,
     ]);
     const child = spawnCommand(config.claude, args, { cwd, useShell: true });
@@ -532,6 +605,7 @@ function runClaude(job, prompt, cwd, model, log) {
           if (block.type === "text" && block.text) {
             log("stdout", block.text);
             job.transcript.push(block.text);
+            job.lastText = block.text;
           } else if (block.type === "tool_use") {
             const text = `[Tool: ${block.name}] ${JSON.stringify(block.input).slice(0, 200)}`;
             log("stdout", text);
@@ -572,11 +646,16 @@ function runClaude(job, prompt, cwd, model, log) {
 
       let error = "";
       if (spawnError) error = `Could not start Claude (${config.claude}): ${spawnError.message}`;
-      else if (result?.subtype === "error_max_turns") error = `Agent hit the max turns limit (${config.maxTurns})`;
+      else if (result?.subtype === "error_max_turns") error = `Agent hit the max turns limit (${maxTurns})`;
       else if (result?.is_error) error = `Agent reported an error: ${String(result.result || result.subtype).slice(0, 500)}`;
       else if (code !== 0) error = `Claude exited with code ${code}`;
 
-      resolve({ error, usage, resultText: result?.result ?? "" });
+      resolve({
+        error,
+        outOfTurns: result?.subtype === "error_max_turns",
+        usage,
+        resultText: result?.result ?? "",
+      });
     });
 
     child.stdin.end(prompt);
@@ -667,6 +746,8 @@ async function runJob(claim) {
     pending: [],
     flushChain: Promise.resolve(),
     transcript: [],
+    lastText: "",
+    checkpoint: undefined,
   };
   jobs.set(task.id, job);
 
@@ -698,10 +779,14 @@ async function runJob(claim) {
 
   try {
     ws = await prepareWorkspace(claim, log);
-    const agent = await runClaude(job, buildPrompt(claim, ws), ws.dir, task.model, log);
+    const maxTurns = claim.maxTurns ?? config.maxTurns;
+    const agent = await runClaude(job, buildPrompt(claim, ws), ws.dir, task.model, maxTurns, log);
     usage = agent.usage;
     if (job.cancelled) return;
-    if (agent.error) throw new Error(agent.error);
+    if (agent.error) {
+      if (agent.outOfTurns) job.checkpoint = await saveCheckpoint(claim, ws, job, log);
+      throw new Error(agent.error);
+    }
     log("system", `Agent finished (${usage.inputTokens.toLocaleString()} in / ${usage.outputTokens.toLocaleString()} out tokens)`);
 
     const published = ws.repo
@@ -742,6 +827,7 @@ async function runJob(claim) {
       runId,
       error: message.slice(0, 2000),
       usage,
+      checkpoint: job.checkpoint,
     }).catch((e) => warn(`Could not report the failure to the board: ${e.message}`));
     info(`x Failed "${task.title}": ${message.split("\n")[0]}`);
   } finally {
@@ -834,6 +920,12 @@ async function main() {
   info(`Claude Code: ${claudeVersion}`);
   info(`Connected to ${config.server} as "${me.name}"${me.owner ? ` (${me.owner})` : ""}`);
   info(`Workspace: ${config.workdir}`);
+  if (me.latestRunnerVersion && me.latestRunnerVersion !== VERSION) {
+    warn(
+      `The board has a different runner version (${me.latestRunnerVersion}, you have ${VERSION}). ` +
+        `Download it again from ${config.server}/agentboard-runner.mjs and restart.`
+    );
+  }
   info(`Waiting for tasks (up to ${config.concurrency} at a time). Press Ctrl+C to stop.`);
 
   process.on("SIGINT", () => shutdown(0));

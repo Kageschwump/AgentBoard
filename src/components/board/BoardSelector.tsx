@@ -43,6 +43,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
   const [editRepoUrl, setEditRepoUrl] = useState("");
   const [editBaseBranch, setEditBaseBranch] = useState("main");
   const [editGitProvider, setEditGitProvider] = useState("");
+  const [editMaxTurns, setEditMaxTurns] = useState("");
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
   const currentBoard = boards.find((b) => b.id === boardId);
@@ -78,6 +79,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
       setEditRepoUrl(currentBoard.repoUrl || "");
       setEditBaseBranch(currentBoard.baseBranch || "main");
       setEditGitProvider(currentBoard.gitProvider || "");
+      setEditMaxTurns(currentBoard.maxTurns ? String(currentBoard.maxTurns) : "");
     }
     setSettingsOpen(true);
   };
@@ -90,6 +92,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
         repoUrl: editRepoUrl.trim(),
         baseBranch: editBaseBranch.trim() || "main",
         gitProvider: editGitProvider,
+        maxTurns: Math.min(1000, Math.max(0, parseInt(editMaxTurns, 10) || 0)),
       },
       {
         onSuccess: () => {
@@ -290,6 +293,24 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
               </select>
               <p className="mt-1 text-xs text-muted-foreground">
                 PRs are opened on the agent&apos;s machine: <code>gh</code> for GitHub, <code>az repos pr</code> for Azure DevOps.
+              </p>
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium">
+                Max turns per task
+              </label>
+              <Input
+                type="number"
+                min={0}
+                max={1000}
+                value={editMaxTurns}
+                onChange={(e) => setEditMaxTurns(e.target.value)}
+                placeholder="Runner default (50)"
+                className="text-sm"
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                How many steps an agent gets before it stops and saves its progress for the next
+                attempt. Tasks can override this.
               </p>
             </div>
             <div className="flex justify-end gap-2">

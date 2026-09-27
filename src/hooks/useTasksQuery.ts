@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import type { Task, Board, Integration, Memory, Skill } from "@/generated/prisma/client";
+import type { Task, Board, Integration, Memory, Skill, Feedback } from "@/generated/prisma/client";
 
 async function fetchTasks(boardId: string): Promise<Task[]> {
   const res = await fetch(`/api/tasks?boardId=${encodeURIComponent(boardId)}`);
@@ -37,6 +37,7 @@ export function useCreateBoard() {
       repoUrl?: string;
       baseBranch?: string;
       gitProvider?: string;
+      maxTurns?: number;
     }) => {
       const res = await fetch("/api/boards", {
         method: "POST",
@@ -68,6 +69,7 @@ export function useUpdateBoard() {
       repoUrl?: string;
       baseBranch?: string;
       gitProvider?: string;
+      maxTurns?: number;
     }) => {
       const res = await fetch(`/api/boards/${id}`, {
         method: "PATCH",
@@ -118,6 +120,7 @@ export function useCreateTask() {
       scheduledFor?: string;
       cronExpression?: string;
       recurring?: boolean;
+      maxTurns?: number;
     }) => {
       const res = await fetch("/api/tasks", {
         method: "POST",
@@ -155,6 +158,9 @@ export function useUpdateTask() {
       scheduledFor?: string | null;
       cronExpression?: string;
       recurring?: boolean;
+      maxTurns?: number;
+      resumeBranch?: "";
+      resumeNote?: "";
     }) => {
       const res = await fetch(`/api/tasks/${id}`, {
         method: "PATCH",
@@ -207,6 +213,69 @@ export function useStopTask() {
       const res = await fetch(`/api/tasks/${id}/stop`, { method: "POST" });
       if (!res.ok) throw new Error("Failed to stop task");
       return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+  });
+}
+
+// Suggestions left on a task for an agent to address
+export function useFeedbackQuery(taskId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["feedback", taskId],
+    queryFn: async (): Promise<Feedback[]> => {
+      const res = await fetch(`/api/tasks/${taskId}/feedback`);
+      if (!res.ok) throw new Error("Failed to fetch suggestions");
+      return res.json();
+    },
+    enabled,
+  });
+}
+
+export function useAddFeedback(taskId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (content: string) => {
+      const res = await fetch(`/api/tasks/${taskId}/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to add suggestion");
+      }
+      return res.json() as Promise<Feedback>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["feedback", taskId] });
+    },
+  });
+}
+
+export function useDeleteFeedback(taskId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (feedbackId: string) => {
+      const res = await fetch(`/api/tasks/${taskId}/feedback/${feedbackId}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to delete suggestion");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["feedback", taskId] });
+    },
+  });
+}
+
+export function useRequestChanges() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (taskId: string) => {
+      const res = await fetch(`/api/tasks/${taskId}/request-changes`, { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to send the task back");
+      }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -276,6 +345,7 @@ export interface RunnerInfo {
   concurrency: number;
   createdAt: string;
   online: boolean;
+  outdated: boolean;
   activeTasks: { id: string; title: string }[];
 }
 

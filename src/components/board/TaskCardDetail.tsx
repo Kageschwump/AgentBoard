@@ -21,6 +21,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { LogViewer } from "../logs/LogViewer";
 import { GitDiffViewer } from "./GitDiffViewer";
+import { TaskFeedback } from "./TaskFeedback";
 import {
   useDeleteTask,
   useStopTask,
@@ -226,6 +227,16 @@ export function TaskCardDetail({
     );
   };
 
+  const handleDiscardProgress = () => {
+    updateTask.mutate(
+      { id: task.id, resumeBranch: "", resumeNote: "" },
+      {
+        onSuccess: () => toast.success("Saved progress discarded. The next attempt starts fresh."),
+        onError: () => toast.error("Failed to discard progress"),
+      }
+    );
+  };
+
   const handleReject = () => {
     updateTask.mutate(
       { id: task.id, status: "failed", error: "Rejected by user" },
@@ -344,6 +355,14 @@ export function TaskCardDetail({
                   {task.summary}
                 </div>
               </div>
+            </>
+          )}
+
+          {/* Suggestions for the next round, once the task has been worked on */}
+          {task.startedAt && (
+            <>
+              <Separator />
+              <TaskFeedback task={task} />
             </>
           )}
 
@@ -536,6 +555,61 @@ export function TaskCardDetail({
               </span>
             )}
           </div>
+
+          {/* Max turns */}
+          <div>
+            <h4 className="mb-1 text-xs font-medium text-muted-foreground">
+              Max turns
+            </h4>
+            <EditableText
+              value={task.maxTurns ? String(task.maxTurns) : ""}
+              onSave={(v) => {
+                const turns = parseInt(v, 10);
+                if (v && (isNaN(turns) || turns < 0 || turns > 1000)) {
+                  toast.error("Max turns must be a number from 0 to 1000");
+                  return;
+                }
+                handleUpdate("maxTurns", turns || 0);
+              }}
+              disabled={!isEditable}
+              placeholder="Board default"
+              className="text-sm"
+            />
+          </div>
+
+          {/* Saved progress from an attempt that ran out of turns */}
+          {task.resumeNote && (
+            <div className="rounded-md bg-blue-500/10 p-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-medium text-blue-400">Saved progress</h4>
+                {task.status !== TaskStatus.IN_PROGRESS && (
+                  <button
+                    className="text-xs text-muted-foreground hover:text-destructive"
+                    onClick={handleDiscardProgress}
+                    disabled={updateTask.isPending}
+                  >
+                    Discard
+                  </button>
+                )}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                An earlier attempt ran out of turns.{" "}
+                {task.status === TaskStatus.IN_PROGRESS ? "This attempt continues" : "The next attempt continues"}{" "}
+                from{" "}
+                {task.resumeBranch ? (
+                  <>
+                    branch <span className="font-mono">{task.resumeBranch}</span>
+                  </>
+                ) : (
+                  "its last message"
+                )}{" "}
+                instead of starting over.
+              </p>
+              {task.resumeNote && (
+                <p className="mt-2 line-clamp-6 whitespace-pre-wrap text-xs">{task.resumeNote}</p>
+              )}
+            </div>
+          )}
 
           {/* Schedule */}
           {(task.scheduledFor || task.cronExpression || task.recurring || task.sourceTaskId) && (
