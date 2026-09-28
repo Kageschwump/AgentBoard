@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const POLL_INTERVAL_MS = 5_000;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const LOG_FLUSH_INTERVAL_MS = 1_000;
@@ -43,6 +43,9 @@ Options:
   --permission-mode <mode>   Claude permission mode (default bypassPermissions;
                              acceptEdits blocks commands that would need approval)
   --max-turns <n>            Max agent turns per task when the board doesn't set one (default 50)
+  --stop-at <percent>        Stop the agent and save its work once a Claude usage limit
+                             (session or weekly) is this % used (default 95; 100 = only
+                             when the limit is actually hit)
   --no-summary               Skip the post-task summary (saves a small Haiku call)
   --config <file>            Settings file (default ~/.agentboard-runner/config.json)
   -v, --verbose              Print all agent output, not just progress
@@ -65,6 +68,7 @@ try {
       claude: { type: "string" },
       "permission-mode": { type: "string" },
       "max-turns": { type: "string" },
+      "stop-at": { type: "string" },
       "no-summary": { type: "boolean" },
       config: { type: "string" },
       verbose: { type: "boolean", short: "v" },
@@ -96,6 +100,7 @@ const config = {
   claude: flags.claude ?? saved.claude ?? "claude",
   permissionMode: flags["permission-mode"] ?? saved.permissionMode ?? "bypassPermissions",
   maxTurns: Math.max(1, parseInt(flags["max-turns"] ?? saved.maxTurns ?? "50", 10) || 50),
+  stopAt: Math.min(100, Math.max(1, parseInt(flags["stop-at"] ?? saved.stopAt ?? "95", 10) || 95)),
   summary: !(flags["no-summary"] ?? saved.noSummary ?? false),
   verbose: !!flags.verbose,
 };
@@ -110,6 +115,7 @@ function saveConfig() {
     claude: config.claude,
     permissionMode: config.permissionMode,
     maxTurns: String(config.maxTurns),
+    stopAt: String(config.stopAt),
     noSummary: !config.summary,
   };
   try {
@@ -450,14 +456,17 @@ async function commitAndPush(ws, message, log) {
 /** Save an attempt's work when it stops early, so the next attempt can pick it up */
 async function saveCheckpoint(claim, ws, job, log, reason) {
   const checkpoint = { branchName: "", note: (job.lastText || "").slice(-2000), diff: "" };
-  if (!ws.repo) return checkpoint;
-  try {
-    log("system", "Saving progress for the next attempt");
-    const diff = await commitAndPush(ws, `[AgentBoard] WIP: ${claim.task.title} (${reason})`, log);
-    if (diff !== null) Object.assign(checkpoint, { branchName: ws.branchName, diff });
-  } catch (err) {
-    log("system", `Could not save progress: ${err.message}`);
+  if (ws.repo) {
+    try {
+      log("system", "Saving progress for the next attempt");
+      const diff = await commitAndPush(ws, `[AgentBoard] WIP: ${claim.task.title} (${reason})`, log);
+      if (diff !== null) Object.assign(checkpoint, { branchName: ws.branchName, diff });
+    } catch (err) {
+      log("system", `Could not save progress: ${err.message}`);
+    }
   }
+  // Nothing for the next attempt to continue from
+  if (!checkpoint.branchName && !checkpoint.note) return undefined;
   return checkpoint;
 }
 
@@ -503,9 +512,35 @@ async function cleanupWorkspace(ws, log) {
 
 // How Claude Code reports that its owner's usage (subscription limit / API rate limit) ran out
 const USAGE_LIMIT_PATTERN =
-  /usage limit|limit reached|hit your (?:usage )?limit|out of (?:extra )?usage|rate_limit_error|API Error: 429/i;
+  /usage limit|limit reached|hit your (?:[\w-]+ )?limit|out of (?:extra )?usage|rate_limit_error|API Error: 429/i;
 // Stricter version for assistant text, so an agent merely discussing limits doesn't match
-const USAGE_LIMIT_MESSAGE = /usage limit reached|hit your (?:usage )?limit/i;
+const USAGE_LIMIT_MESSAGE = /usage limit reached|hit your (?:[\w-]+ )?limit/i;
+
+// Claude Code reports subscription usage in rate_limit_event messages, per window
+const LIMIT_WINDOW_NAMES = {
+  five_hour: "session",
+  seven_day: "weekly",
+  seven_day_opus: "weekly Opus",
+  seven_day_sonnet: "weekly Sonnet",
+  seven_day_overage_included: "weekly",
+};
+
+/** The most-used subscription window in a rate_limit_event (utilization is 0-1), or null */
+function busiestWindow(info) {
+  const windows = Object.entries(info.unifiedWindows ?? {}).map(([type, w]) => ({ type, ...w }));
+  if (info.rateLimitType !== "overage") {
+    windows.push({ type: info.rateLimitType, utilization: info.utilization, resetsAt: info.resetsAt });
+  }
+  let busiest = null;
+  for (const w of windows) {
+    if (typeof w.utilization === "number" && (!busiest || w.utilization > busiest.utilization)) busiest = w;
+  }
+  return busiest;
+}
+
+function epochToDate(seconds) {
+  return typeof seconds === "number" && seconds > 0 ? new Date(seconds * 1000) : null;
+}
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
@@ -634,6 +669,36 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
     const keepRaw = (text) => {
       rawOutput = (rawOutput + "\n" + text).slice(-4000);
     };
+    // Tools the agent asked for that haven't returned yet
+    const pendingTools = new Set();
+    // Claude Code said a usage limit refused the agent's request
+    let limitHit = null;
+    let stoppedForLimit = false;
+
+    const stopForLimit = () => {
+      if (stoppedForLimit) return;
+      stoppedForLimit = true;
+      log("system", "Stopping the agent before the usage limit cuts it off");
+      killTree(child);
+    };
+
+    const noteRateLimit = (info) => {
+      // Paid extra usage takes over at the limit, so nothing gets cut off
+      if (info.overageStatus === "allowed" || info.overageStatus === "allowed_warning") return;
+      if (info.status === "rejected") {
+        const name = LIMIT_WINDOW_NAMES[info.rateLimitType] ?? "usage";
+        limitHit = { resetAt: epochToDate(info.resetsAt), message: `Hit the Claude ${name} limit` };
+        return;
+      }
+      const window = busiestWindow(info);
+      if (job.nearLimit || !window || window.utilization * 100 < config.stopAt) return;
+      const name = LIMIT_WINDOW_NAMES[window.type] ?? "usage";
+      job.nearLimit = {
+        resetAt: epochToDate(window.resetsAt ?? info.resetsAt),
+        message: `Claude ${name} limit is ${Math.round(window.utilization * 100)}% used`,
+      };
+      log("system", `${job.nearLimit.message}, saving the work after the agent's current step`);
+    };
 
     const handleLine = (line) => {
       if (!line.trim()) return;
@@ -653,6 +718,7 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
             // Remembered for checkpoints; Claude Code's own limit notice isn't useful there
             if (!USAGE_LIMIT_MESSAGE.test(block.text)) job.lastText = block.text;
           } else if (block.type === "tool_use") {
+            pendingTools.add(block.id);
             const text = `[Tool: ${block.name}] ${JSON.stringify(block.input).slice(0, 200)}`;
             log("stdout", text);
             job.transcript.push(text);
@@ -661,6 +727,14 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
         if (msg.message.usage && msg.message.id) {
           seenMessages.set(msg.message.id, msg.message.usage);
         }
+      } else if (msg.type === "rate_limit_event" && msg.rate_limit_info) {
+        noteRateLimit(msg.rate_limit_info);
+      } else if (msg.type === "user" && Array.isArray(msg.message?.content)) {
+        for (const block of msg.message.content) {
+          if (block.type === "tool_result") pendingTools.delete(block.tool_use_id);
+        }
+        // Stop between steps, once the tools the agent already started have finished
+        if (job.nearLimit && pendingTools.size === 0) stopForLimit();
       } else if (msg.type === "result") {
         result = msg;
         // The final result usually repeats the last assistant message
@@ -695,6 +769,7 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
 
       let error = "";
       if (spawnError) error = `Could not start Claude (${config.claude}): ${spawnError.message}`;
+      else if (stoppedForLimit) error = job.nearLimit.message;
       else if (result?.subtype === "error_max_turns") error = `Agent hit the max turns limit (${maxTurns})`;
       else if (result?.is_error) error = `Agent reported an error: ${String(result.result || result.subtype).slice(0, 500)}`;
       else if (code !== 0) error = `Claude exited with code ${code}`;
@@ -704,7 +779,11 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
       // Out of Claude usage? Only checked when the run failed for another reason
       // than turns, so an agent merely talking about rate limits doesn't trigger it.
       let usageLimit = null;
-      if (error && !spawnError && !outOfTurns) {
+      if (stoppedForLimit) {
+        usageLimit = { ...job.nearLimit, early: true };
+      } else if (error && limitHit) {
+        usageLimit = limitHit;
+      } else if (error && !spawnError && !outOfTurns) {
         const fromCli = [result?.result, rawOutput].filter(Boolean).join("\n");
         const lastAssistant = job.transcript.at(-1) ?? "";
         if (USAGE_LIMIT_PATTERN.test(fromCli) || USAGE_LIMIT_MESSAGE.test(lastAssistant)) {
@@ -721,6 +800,7 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
         error,
         outOfTurns,
         usageLimit,
+        nearLimit: job.nearLimit,
         usage,
         resultText: result?.result ?? "",
       });
@@ -795,31 +875,31 @@ function formatTime(ms) {
 }
 
 /** Stop taking tasks until the owner's Claude usage resets */
-function pauseForUsageLimit(resetAt) {
+function pauseForUsageLimit(resetAt, reason = "Out of Claude usage") {
   const now = Date.now();
   let until = resetAt ? resetAt.getTime() + 30_000 : now + FALLBACK_PAUSE_MS;
   until = Math.min(Math.max(until, now + MIN_PAUSE_MS), now + MAX_PAUSE_MS);
   if (until <= pausedUntil) return;
   pausedUntil = until;
   warn(
-    `Out of Claude usage${resetAt ? "" : " (couldn't tell when it resets, will check again)"}. ` +
+    `${reason}${resetAt ? "" : " (couldn't tell when it resets, will check again)"}. ` +
       `Pausing until ${formatTime(until)}; other agents take the tasks meanwhile.`
   );
 }
 
 /** Save progress, hand the task back without using a retry, and pause */
 async function handBackForUsageLimit(claim, ws, job, agent, usage, log) {
-  log("system", `Claude usage limit reached: ${agent.usageLimit.message}`);
-  pauseForUsageLimit(agent.usageLimit.resetAt);
+  const { message, resetAt, early } = agent.usageLimit;
+  log("system", early ? `Stopped early: ${message}` : `Claude usage limit reached: ${message}`);
+  pauseForUsageLimit(resetAt, early ? message : undefined);
 
   const checkpoint = await saveCheckpoint(claim, ws, job, log, "out of Claude usage");
-  const madeProgress = !!(checkpoint.branchName || checkpoint.note);
   await flushLogs(job);
   await apiWithRetry("POST", `/api/runner/tasks/${claim.task.id}/fail`, {
     runId: claim.runId,
     error: `${me.name} ran out of Claude usage`,
     usage,
-    ...(madeProgress && { checkpoint }),
+    ...(checkpoint && { checkpoint }),
     requeue: true,
   }).catch((e) => warn(`Could not hand the task back to the board: ${e.message}`));
   info(`~ Handed "${claim.task.title}" back to the board (out of Claude usage)`);
@@ -876,6 +956,7 @@ async function runJob(claim) {
     transcript: [],
     lastText: "",
     checkpoint: undefined,
+    nearLimit: null,
   };
   jobs.set(task.id, job);
 
@@ -916,9 +997,13 @@ async function runJob(claim) {
         await handBackForUsageLimit(claim, ws, job, agent, usage, log);
         return;
       }
-      if (agent.outOfTurns) job.checkpoint = await saveCheckpoint(claim, ws, job, log, "ran out of turns");
+      // Save whatever it got done, whatever stopped it, so the next attempt can continue
+      const reason = agent.outOfTurns ? "ran out of turns" : "stopped with an error";
+      job.checkpoint = await saveCheckpoint(claim, ws, job, log, reason);
       throw new Error(agent.error);
     }
+    // Finished just under the limit: don't start another task until it resets
+    if (agent.nearLimit) pauseForUsageLimit(agent.nearLimit.resetAt, agent.nearLimit.message);
     log("system", `Agent finished (${usage.inputTokens.toLocaleString()} in / ${usage.outputTokens.toLocaleString()} out tokens)`);
 
     const published = ws.repo
