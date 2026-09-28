@@ -18,13 +18,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const POLL_INTERVAL_MS = 5_000;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const LOG_FLUSH_INTERVAL_MS = 1_000;
 const MAX_PENDING_LOGS = 5_000;
 const MAX_DIFF_CHARS = 1_000_000;
 const SUMMARY_TIMEOUT_MS = 120_000;
+// Claude Code doesn't exit after its final result while a Monitor the agent started is running
+const RESULT_EXIT_GRACE_MS = 30_000;
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_DIR = path.join(os.homedir(), ".agentboard-runner");
 
@@ -586,6 +588,7 @@ Work in the current directory: ${ws.dir}`;
   prompt += `\n\n${claim.instructions}`;
   if (claim.resume) prompt += resumeInstructions(claim, ws);
   prompt += `\n\nDo not ask clarifying questions. Execute the task to completion.`;
+  prompt += `\nBefore your final message, stop any monitors and background tasks you started (TaskStop), so nothing is left running on this machine.`;
   return prompt;
 }
 
@@ -674,6 +677,9 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
     // Claude Code said a usage limit refused the agent's request
     let limitHit = null;
     let stoppedForLimit = false;
+    // Stops Claude if it keeps running after its final result
+    let lingerTimer = null;
+    let stoppedLingering = false;
 
     const stopForLimit = () => {
       if (stoppedForLimit) return;
@@ -711,6 +717,7 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
         return;
       }
       if (msg.type === "assistant" && msg.message?.content) {
+        clearTimeout(lingerTimer); // the agent picked up again after a result
         for (const block of msg.message.content) {
           if (block.type === "text" && block.text) {
             log("stdout", block.text);
@@ -739,6 +746,12 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
         result = msg;
         // The final result usually repeats the last assistant message
         if (msg.result && msg.result !== job.transcript.at(-1)) log("stdout", msg.result);
+        clearTimeout(lingerTimer);
+        lingerTimer = setTimeout(() => {
+          stoppedLingering = true;
+          log("system", "Claude kept running after finishing (likely a monitor the agent left on), stopping it");
+          killTree(child);
+        }, RESULT_EXIT_GRACE_MS);
       }
     };
 
@@ -760,6 +773,7 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
     });
     child.on("close", (code) => {
       handleLine(buffered);
+      clearTimeout(lingerTimer);
       const usage = result
         ? usageFromResult(result)
         : [...seenMessages.values()].reduce(
@@ -772,7 +786,7 @@ function runClaude(job, prompt, cwd, model, maxTurns, log) {
       else if (stoppedForLimit) error = job.nearLimit.message;
       else if (result?.subtype === "error_max_turns") error = `Agent hit the max turns limit (${maxTurns})`;
       else if (result?.is_error) error = `Agent reported an error: ${String(result.result || result.subtype).slice(0, 500)}`;
-      else if (code !== 0) error = `Claude exited with code ${code}`;
+      else if (code !== 0 && !stoppedLingering) error = `Claude exited with code ${code}`;
 
       const outOfTurns = result?.subtype === "error_max_turns";
 
