@@ -147,7 +147,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
       <DialogTrigger asChild>
         <Button size="sm">+ New Task</Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Create New Task</DialogTitle>
         </DialogHeader>

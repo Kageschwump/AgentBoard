@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { ScrollArea } from "@/components/ui/scroll-area";
+
+// the logs API returns at most this many lines per request
+const PAGE_SIZE = 500;
 
 interface LogEntry {
   id: string;
@@ -17,22 +19,26 @@ interface LogViewerProps {
 
 export function LogViewer({ taskId, isActive }: LogViewerProps) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const lastTimestampRef = useRef<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const taskIdRef = useRef(taskId);
+  const lastIdRef = useRef<string | null>(null);
   const isFetchingRef = useRef(false);
 
   const fetchLogs = useCallback(async () => {
     if (isFetchingRef.current) return;
     isFetchingRef.current = true;
-    const params = lastTimestampRef.current
-      ? `?after=${encodeURIComponent(lastTimestampRef.current)}`
-      : "";
     try {
-      const res = await fetch(`/api/tasks/${taskId}/logs${params}`);
-      if (!res.ok) return;
-      const newLogs: LogEntry[] = await res.json();
-      if (newLogs.length > 0) {
-        lastTimestampRef.current = newLogs[newLogs.length - 1].timestamp;
+      // keep fetching until we've caught up, so long logs aren't cut off
+      while (taskIdRef.current === taskId) {
+        const params = lastIdRef.current
+          ? `?cursor=${encodeURIComponent(lastIdRef.current)}`
+          : "";
+        const res = await fetch(`/api/tasks/${taskId}/logs${params}`);
+        if (!res.ok || taskIdRef.current !== taskId) return;
+        const newLogs: LogEntry[] = await res.json();
+        if (newLogs.length === 0) return;
+        lastIdRef.current = newLogs[newLogs.length - 1].id;
         setLogs((prev) => {
           const existingIds = new Set(prev.map((log) => log.id));
           const dedupedLogs = newLogs.filter(
@@ -41,6 +47,7 @@ export function LogViewer({ taskId, isActive }: LogViewerProps) {
           if (dedupedLogs.length === 0) return prev;
           return [...prev, ...dedupedLogs];
         });
+        if (newLogs.length < PAGE_SIZE) return;
       }
     } catch {
       // fetch failed
@@ -51,9 +58,11 @@ export function LogViewer({ taskId, isActive }: LogViewerProps) {
 
   useEffect(() => {
     // Reset on taskId change
+    taskIdRef.current = taskId;
     setLogs([]);
-    lastTimestampRef.current = null;
+    lastIdRef.current = null;
     isFetchingRef.current = false;
+    atBottomRef.current = true;
     fetchLogs();
   }, [taskId, fetchLogs]);
 
@@ -64,8 +73,15 @@ export function LogViewer({ taskId, isActive }: LogViewerProps) {
   }, [isActive, fetchLogs]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    // follow new lines, unless the user has scrolled up to read
+    const el = scrollRef.current;
+    if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [logs]);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
+  };
 
   if (logs.length === 0) {
     return (
@@ -76,8 +92,13 @@ export function LogViewer({ taskId, isActive }: LogViewerProps) {
   }
 
   return (
-    <ScrollArea className="flex-1 rounded-md border border-border bg-black/50">
-      <div className="p-3 font-mono text-xs leading-relaxed">
+    // drag the bottom-right corner to make it taller
+    <div
+      ref={scrollRef}
+      onScroll={handleScroll}
+      className="h-80 min-h-24 resize-y overflow-auto rounded-md border border-border bg-black/50"
+    >
+      <div className="p-3 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
         {logs.map((log) => (
           <div
             key={log.id}
@@ -95,8 +116,7 @@ export function LogViewer({ taskId, isActive }: LogViewerProps) {
             {log.content}
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
-    </ScrollArea>
+    </div>
   );
 }
