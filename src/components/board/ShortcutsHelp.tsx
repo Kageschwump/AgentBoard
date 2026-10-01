@@ -14,7 +14,7 @@ interface ShortcutsHelpProps {
 
 const SHORTCUTS = [
   { key: "N", description: "Create new task" },
-  { key: "D", description: "Toggle dispatcher" },
+  { key: "D", description: "Pause / resume queue" },
   { key: "?", description: "Show this help" },
   { key: "Esc", description: "Close dialogs" },
 ];

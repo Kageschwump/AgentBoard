@@ -104,6 +104,7 @@ class TaskScheduler {
           tags: task.tags,
           dependsOn: task.dependsOn,
           model: task.model,
+          assignedRunnerId: task.assignedRunnerId,
           boardId: task.boardId,
           recurring: false,
           sourceTaskId: task.id,

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { emitEvent } from "@/lib/event-emitter";
 import { ensureDefaults } from "@/lib/ensure-defaults";
+import { runnerExists } from "@/lib/runner-auth";
 import { z } from "zod/v4";
 
 const createTaskSchema = z.object({
@@ -17,6 +18,8 @@ const createTaskSchema = z.object({
   scheduledFor: z.string().optional(),
   cronExpression: z.string().optional().default(""),
   recurring: z.boolean().optional().default(false),
+  maxTurns: z.number().int().min(0).max(1000).optional().default(0),
+  assignedRunnerId: z.string().nullable().optional().default(null),
 });
 
 export async function GET(request: Request) {
@@ -27,6 +30,7 @@ export async function GET(request: Request) {
   const tasks = await prisma.task.findMany({
     where: { boardId },
     orderBy: [{ priority: "asc" }, { position: "asc" }, { createdAt: "asc" }],
+    omit: { diff: true }, // can be large; fetched on demand via /api/tasks/[id]/diff
   });
   return NextResponse.json(tasks);
 }
@@ -35,6 +39,9 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const data = createTaskSchema.parse(body);
+    if (data.assignedRunnerId && !(await runnerExists(data.assignedRunnerId))) {
+      return NextResponse.json({ error: "That agent no longer exists" }, { status: 400 });
+    }
 
     const maxPos = await prisma.task.aggregate({
       _max: { position: true },

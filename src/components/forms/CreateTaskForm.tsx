@@ -18,7 +18,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useCreateTask, useSkillsQuery, useBoardsQuery } from "@/hooks/useTasksQuery";
+import {
+  agentLabel,
+  useCreateTask,
+  useSkillsQuery,
+  useBoardsQuery,
+  useRunnersQuery,
+} from "@/hooks/useTasksQuery";
 import { toast } from "sonner";
 import { describeCron } from "@/lib/cron-parser";
 import type { Skill } from "@/generated/prisma/client";
@@ -48,6 +54,8 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   const [tags, setTags] = useState("");
   const [dependsOn, setDependsOn] = useState("");
   const [model, setModel] = useState("");
+  const [maxTurns, setMaxTurns] = useState("");
+  const [assignedRunnerId, setAssignedRunnerId] = useState("any");
   const [requireApproval, setRequireApproval] = useState(false);
   const [showSchedule, setShowSchedule] = useState(false);
   const [scheduledFor, setScheduledFor] = useState("");
@@ -57,8 +65,9 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   const createTask = useCreateTask();
   const { data: skills = [] } = useSkillsQuery();
   const { data: boards = [] } = useBoardsQuery();
+  const { data: runners = [] } = useRunnersQuery(open);
   const currentBoard = boards.find((b) => b.id === boardId);
-  const boardHasRepo = !!(currentBoard as { repoPath?: string })?.repoPath;
+  const boardHasRepo = !!currentBoard?.repoUrl;
 
   // Apply initial skill when provided
   useEffect(() => {
@@ -109,6 +118,8 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
         tags: finalTags,
         dependsOn: dependsOnJson,
         model: model === "default" ? "" : model,
+        maxTurns: parseInt(maxTurns, 10) || 0,
+        assignedRunnerId: assignedRunnerId === "any" ? null : assignedRunnerId,
         boardId,
         ...(scheduledFor && { scheduledFor }),
         ...(cronExpression && { cronExpression }),
@@ -125,6 +136,8 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           setTags("");
           setDependsOn("");
           setModel("");
+          setMaxTurns("");
+          setAssignedRunnerId("any");
           setRequireApproval(false);
           setShowSchedule(false);
           setScheduledFor("");
@@ -132,8 +145,8 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           setRecurring(false);
           setOpen(false);
         },
-        onError: () => {
-          toast.error("Failed to create task");
+        onError: (err) => {
+          toast.error(err.message || "Failed to create task");
         },
       }
     );
@@ -144,7 +157,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
       <DialogTrigger asChild>
         <Button size="sm">+ New Task</Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Create New Task</DialogTitle>
         </DialogHeader>
@@ -203,18 +216,18 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           {boardHasRepo ? (
             <div className="rounded-md bg-muted/30 p-3">
               <p className="text-xs text-muted-foreground">
-                This board is connected to a git repository. The agent will work on its own branch automatically.
+                This board is connected to a git repository. The agent will work on its own branch and open a PR.
               </p>
             </div>
           ) : (
             <div>
               <label className="mb-1 block text-sm font-medium">
-                Working Directory
+                Repository (optional)
               </label>
               <Input
                 value={repoUrl}
                 onChange={(e) => setRepoUrl(e.target.value)}
-                placeholder="Defaults to workspaces/<taskId> if empty"
+                placeholder="Git URL to clone. Empty = a scratch folder on the agent's machine"
               />
             </div>
           )}
@@ -239,7 +252,30 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className="mb-1 block text-sm font-medium">Agent</label>
+            <Select value={assignedRunnerId} onValueChange={setAssignedRunnerId}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="any">Any agent</SelectItem>
+                {runners.map((r) => (
+                  <SelectItem key={r.id} value={r.id}>
+                    {agentLabel(r)}
+                    {!r.online && " · offline"}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {assignedRunnerId === "any"
+                ? "The first free agent picks it up."
+                : "Only this agent can pick it up."}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
             <div>
               <label className="mb-1 block text-sm font-medium">Priority</label>
               <Select value={priority} onValueChange={setPriority}>
@@ -267,6 +303,19 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
                   <SelectItem value="haiku">Haiku</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+
+            <div>
+              <label className="mb-1 block text-sm font-medium">Max turns</label>
+              <Input
+                type="number"
+                min={0}
+                max={1000}
+                value={maxTurns}
+                onChange={(e) => setMaxTurns(e.target.value)}
+                placeholder="Board default"
+                title="How many steps the agent gets before it stops and saves its progress"
+              />
             </div>
           </div>
 

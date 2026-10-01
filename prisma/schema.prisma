@@ -12,10 +12,9 @@ model Task {
   title       String
   description String    @default("")
   criteria    String    @default("")
-  repoUrl     String    @default("")
-  status      String    @default("todo") // todo | ready | in_progress | done | failed
+  repoUrl     String    @default("") // git repo override (clone URL); empty = use the board's repo
+  status      String    @default("todo") // todo | ready | in_progress | review | done | failed
   priority    Int       @default(2) // 1=high, 2=medium, 3=low
-  agentPid    Int?
   startedAt   DateTime?
   completedAt DateTime?
   retryCount  Int       @default(0)
@@ -38,23 +37,68 @@ model Task {
   // Git workflow fields
   branchName   String   @default("") // git branch for this task
   prUrl        String   @default("") // pull request URL
-  worktreePath String   @default("") // path to git worktree
+  diff         String   @default("") // diff uploaded by the runner when the task finished
+  // Checkpoint left by an attempt that ran out of turns; the next attempt continues from it
+  resumeBranch String   @default("") // pushed branch holding the partial work ("" = start fresh)
+  resumeNote   String   @default("") // last message from that attempt
+  maxTurns     Int      @default(0) // agent turn limit; 0 = board default
+  // Remote runner fields
+  assignedRunnerId String?        // only this runner may claim the task; null = any runner
+  runnerId     String?            // runner currently (or last) working on this task
+  runnerName   String   @default("") // denormalized so history survives runner deletion
+  runId        String   @default("") // lease id of the latest attempt; runner calls must match it
+  heartbeatAt  DateTime?          // last heartbeat from the runner for the current run
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  board Board  @relation(fields: [boardId], references: [id])
-  logs  TaskLog[]
+  board    Board      @relation(fields: [boardId], references: [id])
+  runner   Runner?    @relation("TaskRunner", fields: [runnerId], references: [id], onDelete: SetNull)
+  assignedRunner Runner? @relation("TaskAssignedRunner", fields: [assignedRunnerId], references: [id], onDelete: SetNull)
+  logs     TaskLog[]
+  feedback Feedback[]
 
   @@index([boardId])
+  @@index([status])
+}
+
+// Suggestions left on a task (e.g. after playtesting) for an agent to address
+model Feedback {
+  id          String    @id @default(cuid())
+  taskId      String
+  content     String
+  addressedAt DateTime? // set when an agent run that included it finished successfully
+  createdAt   DateTime  @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+model Runner {
+  id          String    @id @default(cuid())
+  name        String              // e.g. "kasper-desktop"
+  owner       String    @default("") // who runs it
+  tokenHash   String    @unique   // sha256 of the runner's token
+  tokenPrefix String              // first few chars of the token, for display
+  lastSeenAt  DateTime?
+  version     String    @default("")
+  platform    String    @default("")
+  concurrency Int       @default(1) // as reported by the runner
+  pausedUntil DateTime? // set while the runner waits out its owner's Claude usage limit
+  createdAt   DateTime  @default(now())
+
+  tasks         Task[] @relation("TaskRunner")
+  assignedTasks Task[] @relation("TaskAssignedRunner")
 }
 
 model Board {
   id          String   @id @default(cuid())
   name        String
   description String   @default("")
-  repoPath    String   @default("") // local path to git repo
+  repoUrl     String   @default("") // git clone URL; runners check it out per task
   baseBranch  String   @default("main") // base branch for PRs
   gitProvider String   @default("") // "" = auto-detect, "github", "azuredevops"
+  maxTurns    Int      @default(0) // default agent turn limit for tasks; 0 = the runner's default
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 

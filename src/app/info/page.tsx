@@ -175,7 +175,7 @@ export default function InfoPage() {
             Git-native by design
           </h2>
           <p className="mx-auto mt-4 max-w-2xl text-muted-foreground">
-            Every task gets its own isolated git worktree. Agents never step on
+            Every task gets its own branch and worktree on the agent&apos;s machine. Agents never step on
             each other. You review the PR, not raw logs.
           </p>
         </div>
@@ -190,7 +190,7 @@ export default function InfoPage() {
               <div className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-blue-500/10 text-blue-500 font-bold text-sm">1</div>
               <h3 className="mt-3 text-lg font-semibold">Connect a repo</h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                Point your board at any local git clone. Set the base branch.
+                Point your board at a git repo URL. Set the base branch.
                 Auto-detects GitHub or Azure DevOps from the remote URL.
               </p>
             </div>
@@ -202,8 +202,8 @@ export default function InfoPage() {
               <div className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-violet-500/10 text-violet-500 font-bold text-sm">2</div>
               <h3 className="mt-3 text-lg font-semibold">Dispatch a task</h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                The platform creates a worktree at{" "}
-                <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono">.worktrees/&lt;taskId&gt;</code>{" "}
+                The runner that claims it creates a worktree at{" "}
+                <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono">~/.agentboard-runner/worktrees/&lt;taskId&gt;</code>{" "}
                 on a fresh branch. The agent works in total isolation.
               </p>
             </div>
@@ -213,7 +213,7 @@ export default function InfoPage() {
               <div className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-green-500/10 text-green-500 font-bold text-sm">3</div>
               <h3 className="mt-3 text-lg font-semibold">Auto PR on completion</h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                Agent finishes &rarr; platform commits, pushes, and opens a pull
+                Agent finishes &rarr; the runner commits, pushes, and opens a pull
                 request. The PR URL appears on the task card. Click to review on
                 GitHub or Azure DevOps.
               </p>
@@ -227,7 +227,7 @@ export default function InfoPage() {
               <h3 className="mt-3 text-lg font-semibold">Approve &amp; Merge</h3>
               <p className="mt-1 text-sm text-muted-foreground">
                 Click &ldquo;Approve &amp; Merge&rdquo; in the task detail. The PR
-                merges, the branch is deleted, and the worktree is cleaned up.
+                merges (with GITHUB_TOKEN set on the server) and the branch is deleted.
                 Reject closes the PR instead.
               </p>
             </div>
@@ -262,7 +262,7 @@ export default function InfoPage() {
             <FeatureCard
               icon={<IconBot />}
               title="Multi-Agent Dispatch"
-              description="Run up to 10 Claude agents in parallel. The dispatcher enforces dependency order and auto-retries failures."
+              description="Friends connect their own Claude Code agents with a runner token. The queue enforces dependency order and re-queues failed or lost runs."
             />
             <FeatureCard
               icon={<IconShield />}
@@ -318,9 +318,9 @@ export default function InfoPage() {
             <div className="text-3xl font-black text-muted-foreground/30">02</div>
             <h3 className="mt-4 text-lg font-semibold">Agents execute</h3>
             <p className="mt-2 text-sm text-muted-foreground">
-              Move tasks to Ready and toggle the dispatcher. It spawns Claude
-              Code agents in isolated worktrees, injects board memory into
-              prompts, respects dependency ordering, and streams logs in
+              Move tasks to Ready. Connected runners claim them and run Claude
+              Code on their own machines in isolated worktrees, with board memory in
+              the prompt. Dependencies are respected and logs stream back in
               real-time.
             </p>
           </div>
@@ -346,9 +346,9 @@ export default function InfoPage() {
                 Self-hosted.<br />No vendor lock-in.
               </h2>
               <p className="mt-4 text-muted-foreground">
-                AgentBoard runs on your machine. Your code never leaves your
-                network. No cloud service, no API keys for the board itself, no
-                telemetry. Just a Next.js app with a SQLite database.
+                Host the board anywhere (it&apos;s a Next.js app with a SQLite database)
+                and everyone runs agents on their own machines with their own Claude
+                subscriptions. No API keys for the board itself, no telemetry.
               </p>
               <ul className="mt-8 space-y-3 text-sm">
                 {[
@@ -388,7 +388,7 @@ export default function InfoPage() {
               </div>
               <div className="mt-4 text-muted-foreground"># Open http://localhost:3000</div>
               <div className="text-muted-foreground"># Connect a repo in Board Settings</div>
-              <div className="text-muted-foreground"># Create tasks, toggle the dispatcher</div>
+              <div className="text-muted-foreground"># Connect agents in the Agents panel, then create tasks</div>
             </div>
           </div>
         </div>

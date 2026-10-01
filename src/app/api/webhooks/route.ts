@@ -113,11 +113,14 @@ async function handleGitHubWebhook(body: Record<string, unknown>) {
     where: { status: "todo" },
   });
 
+  const repository = body.repository as { clone_url?: string } | undefined;
   const task = await prisma.task.create({
     data: {
       title: issue.title,
-      description: issue.body || "",
-      repoUrl: issue.html_url || "",
+      description: [issue.body, issue.html_url && `Source: ${issue.html_url}`]
+        .filter(Boolean)
+        .join("\n\n"),
+      repoUrl: repository?.clone_url || "",
       boardId: "default",
       tags: body.pull_request ? "pr" : "issue",
       position: (maxPos._max.position ?? 0) + 1,

@@ -30,6 +30,7 @@ export function useEventSource() {
 
             queryClient.invalidateQueries({ queryKey: ["tasks"] });
             queryClient.invalidateQueries({ queryKey: ["analytics"] });
+            queryClient.invalidateQueries({ queryKey: ["feedback", data.taskId] });
 
             // Send notification on completion or failure
             if (prevTask && prevTask.status === "in_progress") {
@@ -54,6 +55,10 @@ export function useEventSource() {
             }
           }
           if (data.type === "dispatcher:status") {
+            queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
+          }
+          if (data.type === "runners:updated") {
+            queryClient.invalidateQueries({ queryKey: ["runners"] });
             queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
           }
           if (data.type === "memory:updated") {

@@ -12,7 +12,7 @@ import {
   TaskStatus,
 } from "@/lib/types";
 import { tagColor } from "@/lib/tag-colors";
-import { useTasksQuery } from "@/hooks/useTasksQuery";
+import { agentLabel, useRunnersQuery, useTasksQuery } from "@/hooks/useTasksQuery";
 import type { Task } from "@/generated/prisma/client";
 
 interface TaskCardProps {
@@ -22,6 +22,8 @@ interface TaskCardProps {
 export function TaskCard({ task }: TaskCardProps) {
   const [detailOpen, setDetailOpen] = useState(false);
   const { data: allTasks } = useTasksQuery();
+  const { data: runners } = useRunnersQuery(!!task.assignedRunnerId);
+  const assignedRunner = runners?.find((r) => r.id === task.assignedRunnerId);
 
   const tags = useMemo(
     () =>
@@ -96,6 +98,26 @@ export function TaskCard({ task }: TaskCardProps) {
             </Badge>
           )}
 
+          {task.resumeNote && task.status !== TaskStatus.DONE && (
+            <Badge
+              variant="outline"
+              className="text-[10px] border-blue-500/30 bg-blue-500/10 text-blue-400"
+              title="An earlier attempt stopped before finishing (out of turns or usage); the next one continues from its progress"
+            >
+              Saved progress
+            </Badge>
+          )}
+
+          {task.assignedRunnerId && (task.status === TaskStatus.TODO || task.status === TaskStatus.READY) && (
+            <Badge
+              variant="outline"
+              className="min-w-0 truncate text-[10px] border-teal-500/30 bg-teal-500/10 text-teal-400"
+              title="Only this agent can pick it up"
+            >
+              for {assignedRunner ? agentLabel(assignedRunner) : "one agent"}
+            </Badge>
+          )}
+
           {task.scheduledFor && (
             <Badge variant="outline" className="text-[10px] border-blue-500/30 bg-blue-500/10 text-blue-400">
               Scheduled
@@ -117,6 +139,15 @@ export function TaskCard({ task }: TaskCardProps) {
           {task.status === TaskStatus.IN_PROGRESS && task.startedAt && (
             <span className="text-[10px] text-muted-foreground">
               <ElapsedTime start={new Date(task.startedAt)} />
+            </span>
+          )}
+
+          {task.runnerName && task.status !== TaskStatus.TODO && task.status !== TaskStatus.READY && (
+            <span
+              className="min-w-0 truncate text-[10px] text-muted-foreground"
+              title={`Agent: ${task.runnerName}`}
+            >
+              by {task.runnerName}
             </span>
           )}
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import type { Task, Board, Integration, Memory, Skill } from "@/generated/prisma/client";
+import type { Task, Board, Integration, Memory, Skill, Feedback } from "@/generated/prisma/client";
 
 async function fetchTasks(boardId: string): Promise<Task[]> {
   const res = await fetch(`/api/tasks?boardId=${encodeURIComponent(boardId)}`);
@@ -34,9 +34,10 @@ export function useCreateBoard() {
     mutationFn: async (data: {
       name: string;
       description?: string;
-      repoPath?: string;
+      repoUrl?: string;
       baseBranch?: string;
       gitProvider?: string;
+      maxTurns?: number;
     }) => {
       const res = await fetch("/api/boards", {
         method: "POST",
@@ -65,9 +66,10 @@ export function useUpdateBoard() {
       id: string;
       name?: string;
       description?: string;
-      repoPath?: string;
+      repoUrl?: string;
       baseBranch?: string;
       gitProvider?: string;
+      maxTurns?: number;
     }) => {
       const res = await fetch(`/api/boards/${id}`, {
         method: "PATCH",
@@ -118,13 +120,18 @@ export function useCreateTask() {
       scheduledFor?: string;
       cronExpression?: string;
       recurring?: boolean;
+      maxTurns?: number;
+      assignedRunnerId?: string | null;
     }) => {
       const res = await fetch("/api/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data),
       });
-      if (!res.ok) throw new Error("Failed to create task");
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to create task");
+      }
       return res.json();
     },
     onSuccess: () => {
@@ -155,6 +162,10 @@ export function useUpdateTask() {
       scheduledFor?: string | null;
       cronExpression?: string;
       recurring?: boolean;
+      maxTurns?: number;
+      assignedRunnerId?: string | null;
+      resumeBranch?: "";
+      resumeNote?: "";
     }) => {
       const res = await fetch(`/api/tasks/${id}`, {
         method: "PATCH",
@@ -214,6 +225,69 @@ export function useStopTask() {
   });
 }
 
+// Suggestions left on a task for an agent to address
+export function useFeedbackQuery(taskId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["feedback", taskId],
+    queryFn: async (): Promise<Feedback[]> => {
+      const res = await fetch(`/api/tasks/${taskId}/feedback`);
+      if (!res.ok) throw new Error("Failed to fetch suggestions");
+      return res.json();
+    },
+    enabled,
+  });
+}
+
+export function useAddFeedback(taskId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (content: string) => {
+      const res = await fetch(`/api/tasks/${taskId}/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to add suggestion");
+      }
+      return res.json() as Promise<Feedback>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["feedback", taskId] });
+    },
+  });
+}
+
+export function useDeleteFeedback(taskId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (feedbackId: string) => {
+      const res = await fetch(`/api/tasks/${taskId}/feedback/${feedbackId}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to delete suggestion");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["feedback", taskId] });
+    },
+  });
+}
+
+export function useRequestChanges() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (taskId: string) => {
+      const res = await fetch(`/api/tasks/${taskId}/request-changes`, { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to send the task back");
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+  });
+}
+
 export function useRetryTask() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -233,42 +307,103 @@ export function useDispatcherStatus() {
     queryKey: ["dispatcher"],
     queryFn: async () => {
       const res = await fetch("/api/dispatcher");
-      if (!res.ok) throw new Error("Failed to fetch dispatcher status");
+      if (!res.ok) throw new Error("Failed to fetch queue status");
       return res.json() as Promise<{
         running: boolean;
+        onlineRunners: number;
         activeTasks: number;
-        maxConcurrent: number;
+        canMergePrs: boolean;
+        authEnabled: boolean;
       }>;
     },
+    refetchInterval: 15_000, // runners drop offline without an event
   });
 }
 
-export function useSettings() {
-  return useQuery({
-    queryKey: ["settings"],
-    queryFn: async () => {
-      const res = await fetch("/api/settings");
-      if (!res.ok) throw new Error("Failed to fetch settings");
-      return res.json() as Promise<{ maxConcurrent: number }>;
-    },
-  });
-}
-
-export function useUpdateSetting() {
+export function useToggleQueue() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (data: { key: string; value: string }) => {
-      const res = await fetch("/api/settings", {
-        method: "PUT",
+    mutationFn: async (running: boolean) => {
+      const res = await fetch("/api/dispatcher", {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
+        body: JSON.stringify({ action: running ? "start" : "stop" }),
       });
-      if (!res.ok) throw new Error("Failed to update setting");
+      if (!res.ok) throw new Error("Failed to update the queue");
       return res.json();
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["settings"] });
       queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
+    },
+  });
+}
+
+// Runner (connected agent) hooks
+export interface RunnerInfo {
+  id: string;
+  name: string;
+  owner: string;
+  tokenPrefix: string;
+  lastSeenAt: string | null;
+  version: string;
+  platform: string;
+  concurrency: number;
+  createdAt: string;
+  online: boolean;
+  outdated: boolean;
+  pausedUntil: string | null;
+  activeTasks: { id: string; title: string }[];
+}
+
+export function agentLabel(runner: Pick<RunnerInfo, "name" | "owner">): string {
+  return runner.owner ? `${runner.name} (${runner.owner})` : runner.name;
+}
+
+export function useRunnersQuery(enabled = true) {
+  return useQuery({
+    queryKey: ["runners"],
+    queryFn: async (): Promise<RunnerInfo[]> => {
+      const res = await fetch("/api/runners");
+      if (!res.ok) throw new Error("Failed to fetch agents");
+      return res.json();
+    },
+    enabled,
+    refetchInterval: enabled ? 10_000 : false,
+  });
+}
+
+export function useCreateRunner() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (data: { name: string; owner?: string }) => {
+      const res = await fetch("/api/runners", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to create agent");
+      }
+      return res.json() as Promise<{ id: string; name: string; owner: string; token: string }>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["runners"] });
+    },
+  });
+}
+
+export function useDeleteRunner() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const res = await fetch(`/api/runners/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to disconnect agent");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["runners"] });
+      queryClient.invalidateQueries({ queryKey: ["dispatcher"] });
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
   });
 }
