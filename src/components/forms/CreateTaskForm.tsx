@@ -18,7 +18,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useCreateTask, useSkillsQuery, useBoardsQuery } from "@/hooks/useTasksQuery";
+import {
+  agentLabel,
+  useCreateTask,
+  useSkillsQuery,
+  useBoardsQuery,
+  useRunnersQuery,
+} from "@/hooks/useTasksQuery";
 import { toast } from "sonner";
 import { describeCron } from "@/lib/cron-parser";
 import type { Skill } from "@/generated/prisma/client";
@@ -49,6 +55,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   const [dependsOn, setDependsOn] = useState("");
   const [model, setModel] = useState("");
   const [maxTurns, setMaxTurns] = useState("");
+  const [assignedRunnerId, setAssignedRunnerId] = useState("any");
   const [requireApproval, setRequireApproval] = useState(false);
   const [showSchedule, setShowSchedule] = useState(false);
   const [scheduledFor, setScheduledFor] = useState("");
@@ -58,6 +65,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   const createTask = useCreateTask();
   const { data: skills = [] } = useSkillsQuery();
   const { data: boards = [] } = useBoardsQuery();
+  const { data: runners = [] } = useRunnersQuery(open);
   const currentBoard = boards.find((b) => b.id === boardId);
   const boardHasRepo = !!currentBoard?.repoUrl;
 
@@ -111,6 +119,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
         dependsOn: dependsOnJson,
         model: model === "default" ? "" : model,
         maxTurns: parseInt(maxTurns, 10) || 0,
+        assignedRunnerId: assignedRunnerId === "any" ? null : assignedRunnerId,
         boardId,
         ...(scheduledFor && { scheduledFor }),
         ...(cronExpression && { cronExpression }),
@@ -128,6 +137,7 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           setDependsOn("");
           setModel("");
           setMaxTurns("");
+          setAssignedRunnerId("any");
           setRequireApproval(false);
           setShowSchedule(false);
           setScheduledFor("");
@@ -135,8 +145,8 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           setRecurring(false);
           setOpen(false);
         },
-        onError: () => {
-          toast.error("Failed to create task");
+        onError: (err) => {
+          toast.error(err.message || "Failed to create task");
         },
       }
     );
@@ -240,6 +250,29 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
               onChange={(e) => setDependsOn(e.target.value)}
               placeholder="Comma-separated task IDs"
             />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-sm font-medium">Agent</label>
+            <Select value={assignedRunnerId} onValueChange={setAssignedRunnerId}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="any">Any agent</SelectItem>
+                {runners.map((r) => (
+                  <SelectItem key={r.id} value={r.id}>
+                    {agentLabel(r)}
+                    {!r.online && " · offline"}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {assignedRunnerId === "any"
+                ? "The first free agent picks it up."
+                : "Only this agent can pick it up."}
+            </p>
           </div>
 
           <div className="grid grid-cols-3 gap-4">

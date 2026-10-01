@@ -12,6 +12,10 @@ export function isRunnerOnline(lastSeenAt: Date | null): boolean {
   return !!lastSeenAt && Date.now() - lastSeenAt.getTime() < RUNNER_ONLINE_WINDOW_MS;
 }
 
+export async function runnerExists(id: string): Promise<boolean> {
+  return (await prisma.runner.count({ where: { id } })) > 0;
+}
+
 /**
  * Authenticate a runner request by its bearer token.
  * Returns the runner, or a 401 response to send back.

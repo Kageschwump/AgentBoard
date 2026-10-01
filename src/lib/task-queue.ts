@@ -146,6 +146,7 @@ export async function claimTask(
     where: {
       status: "ready",
       ...(boardIds.length > 0 && { boardId: { in: boardIds } }),
+      OR: [{ assignedRunnerId: null }, { assignedRunnerId: runner.id }],
     },
     orderBy: [{ priority: "asc" }, { createdAt: "asc" }],
     take: 25,

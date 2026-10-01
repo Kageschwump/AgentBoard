@@ -43,6 +43,7 @@ model Task {
   resumeNote   String   @default("") // last message from that attempt
   maxTurns     Int      @default(0) // agent turn limit; 0 = board default
   // Remote runner fields
+  assignedRunnerId String?        // only this runner may claim the task; null = any runner
   runnerId     String?            // runner currently (or last) working on this task
   runnerName   String   @default("") // denormalized so history survives runner deletion
   runId        String   @default("") // lease id of the latest attempt; runner calls must match it
@@ -51,7 +52,8 @@ model Task {
   updatedAt   DateTime  @updatedAt
 
   board    Board      @relation(fields: [boardId], references: [id])
-  runner   Runner?    @relation(fields: [runnerId], references: [id], onDelete: SetNull)
+  runner   Runner?    @relation("TaskRunner", fields: [runnerId], references: [id], onDelete: SetNull)
+  assignedRunner Runner? @relation("TaskAssignedRunner", fields: [assignedRunnerId], references: [id], onDelete: SetNull)
   logs     TaskLog[]
   feedback Feedback[]
 
@@ -85,7 +87,8 @@ model Runner {
   pausedUntil DateTime? // set while the runner waits out its owner's Claude usage limit
   createdAt   DateTime  @default(now())
 
-  tasks Task[]
+  tasks         Task[] @relation("TaskRunner")
+  assignedTasks Task[] @relation("TaskAssignedRunner")
 }
 
 model Board {

@@ -3,6 +3,7 @@ import { prisma } from "@/lib/db";
 import { emitEvent } from "@/lib/event-emitter";
 import { z } from "zod/v4";
 import { mergeGitHubPr, closeGitHubPr } from "@/lib/github";
+import { runnerExists } from "@/lib/runner-auth";
 
 const updateTaskSchema = z.object({
   title: z.string().min(1).optional(),
@@ -25,6 +26,7 @@ const updateTaskSchema = z.object({
   cronExpression: z.string().optional(),
   recurring: z.boolean().optional(),
   maxTurns: z.number().int().min(0).max(1000).optional(),
+  assignedRunnerId: z.string().nullable().optional(),
   // Only clearing is allowed: discards saved progress so the next attempt starts fresh
   resumeBranch: z.literal("").optional(),
   resumeNote: z.literal("").optional(),
@@ -50,6 +52,9 @@ export async function PATCH(
   try {
     const body = await request.json();
     const { scheduledFor, ...rest } = updateTaskSchema.parse(body);
+    if (rest.assignedRunnerId && !(await runnerExists(rest.assignedRunnerId))) {
+      return NextResponse.json({ error: "That agent no longer exists" }, { status: 400 });
+    }
 
     // Fetch current task to detect status transitions
     const currentTask = await prisma.task.findUnique({ where: { id } });

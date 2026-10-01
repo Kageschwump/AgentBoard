@@ -121,13 +121,17 @@ export function useCreateTask() {
       cronExpression?: string;
       recurring?: boolean;
       maxTurns?: number;
+      assignedRunnerId?: string | null;
     }) => {
       const res = await fetch("/api/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data),
       });
-      if (!res.ok) throw new Error("Failed to create task");
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to create task");
+      }
       return res.json();
     },
     onSuccess: () => {
@@ -159,6 +163,7 @@ export function useUpdateTask() {
       cronExpression?: string;
       recurring?: boolean;
       maxTurns?: number;
+      assignedRunnerId?: string | null;
       resumeBranch?: "";
       resumeNote?: "";
     }) => {
@@ -348,6 +353,10 @@ export interface RunnerInfo {
   outdated: boolean;
   pausedUntil: string | null;
   activeTasks: { id: string; title: string }[];
+}
+
+export function agentLabel(runner: Pick<RunnerInfo, "name" | "owner">): string {
+  return runner.owner ? `${runner.name} (${runner.owner})` : runner.name;
 }
 
 export function useRunnersQuery(enabled = true) {

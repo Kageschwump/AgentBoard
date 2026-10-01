@@ -23,12 +23,14 @@ import { LogViewer } from "../logs/LogViewer";
 import { GitDiffViewer } from "./GitDiffViewer";
 import { TaskFeedback } from "./TaskFeedback";
 import {
+  agentLabel,
   useDeleteTask,
   useStopTask,
   useRetryTask,
   useUpdateTask,
   useTasksQuery,
   useDispatcherStatus,
+  useRunnersQuery,
 } from "@/hooks/useTasksQuery";
 import {
   PRIORITY_LABELS,
@@ -161,6 +163,8 @@ export function TaskCardDetail({
   const { data: allTasks } = useTasksQuery();
   const { data: queueStatus } = useDispatcherStatus();
   const canMergePrs = !!queueStatus?.canMergePrs;
+  const { data: runners = [] } = useRunnersQuery(open);
+  const assignedRunner = runners.find((r) => r.id === task.assignedRunnerId);
   const [diffOpen, setDiffOpen] = useState(false);
 
   const isEditable =
@@ -182,6 +186,16 @@ export function TaskCardDetail({
     },
     [task.id, updateTask]
   );
+
+  const handleAssign = (value: string) => {
+    updateTask.mutate(
+      { id: task.id, assignedRunnerId: value === "any" ? null : value },
+      {
+        onSuccess: () => toast.success("Task updated"),
+        onError: (err) => toast.error(err.message || "Failed to update task"),
+      }
+    );
+  };
 
   const handleStop = () => {
     stopTask.mutate(task.id, {
@@ -552,6 +566,33 @@ export function TaskCardDetail({
             ) : (
               <span className="px-2 py-1 text-sm capitalize">
                 {task.model || "Default"}
+              </span>
+            )}
+          </div>
+
+          {/* Which agent may pick it up */}
+          <div>
+            <h4 className="mb-1 text-xs font-medium text-muted-foreground">
+              Assigned agent
+            </h4>
+            {isEditable ? (
+              <Select value={task.assignedRunnerId ?? "any"} onValueChange={handleAssign}>
+                <SelectTrigger className="h-8 text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="any">Any agent</SelectItem>
+                  {runners.map((r) => (
+                    <SelectItem key={r.id} value={r.id}>
+                      {agentLabel(r)}
+                      {!r.online && " · offline"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
+              <span className="px-2 py-1 text-sm">
+                {task.assignedRunnerId ? (assignedRunner ? agentLabel(assignedRunner) : "…") : "Any agent"}
               </span>
             )}
           </div>

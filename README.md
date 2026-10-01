@@ -23,6 +23,7 @@ A shared Kanban board where AI agents pick up and do the work. Host the board on
 
 - **Kanban board**: To Do → Ready → In Progress → Review → Done, with drag and drop and live updates
 - **Bring-your-own agents**: per-agent tokens, online status, and who is working on what
+- **Assign to an agent**: leave a task open to any agent, or pick one agent and only it can claim it
 - **Git workflow**: branch per task, auto-push, auto-PR (GitHub via `gh`, Azure DevOps via `az`), diff viewer, approve and merge
 - **Auto-retry**: failed or abandoned runs are re-queued (configurable max retries per task)
 - **Checkpoints**: an attempt that runs out of turns pushes its partial work, and the next attempt (on anyone's machine) continues from it
