@@ -21,7 +21,7 @@ interface TaskCardProps {
 
 export function TaskCard({ task }: TaskCardProps) {
   const [detailOpen, setDetailOpen] = useState(false);
-  const { data: allTasks } = useTasksQuery();
+  const { data: allTasks } = useTasksQuery(task.boardId);
   const { data: runners } = useRunnersQuery(!!task.assignedRunnerId);
   const assignedRunner = runners?.find((r) => r.id === task.assignedRunnerId);
 

@@ -24,10 +24,12 @@ import {
   useSkillsQuery,
   useBoardsQuery,
   useRunnersQuery,
+  useTasksQuery,
 } from "@/hooks/useTasksQuery";
 import { toast } from "sonner";
 import { describeCron } from "@/lib/cron-parser";
 import type { Skill } from "@/generated/prisma/client";
+import { DependsOnPicker, serializeDependsOn } from "./DependsOnPicker";
 
 interface CreateTaskFormProps {
   boardId?: string;
@@ -48,11 +50,10 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   );
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [criteria, setCriteria] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
   const [priority, setPriority] = useState("2");
   const [tags, setTags] = useState("");
-  const [dependsOn, setDependsOn] = useState("");
+  const [dependsOn, setDependsOn] = useState<string[]>([]);
   const [model, setModel] = useState("");
   const [maxTurns, setMaxTurns] = useState("");
   const [assignedRunnerId, setAssignedRunnerId] = useState("any");
@@ -66,37 +67,36 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
   const { data: skills = [] } = useSkillsQuery();
   const { data: boards = [] } = useBoardsQuery();
   const { data: runners = [] } = useRunnersQuery(open);
+  const { data: boardTasks = [] } = useTasksQuery(boardId);
   const currentBoard = boards.find((b) => b.id === boardId);
   const boardHasRepo = !!currentBoard?.repoUrl;
 
+  // A skill's acceptance criteria go into the description, the task's only free text
+  const applySkill = (skill: Skill) => {
+    if (!description.trim()) {
+      setDescription(
+        skill.criteria.trim()
+          ? `${skill.prompt}\n\nDone when:\n${skill.criteria}`
+          : skill.prompt
+      );
+    }
+    if (skill.model && !model) setModel(skill.model);
+  };
+
   // Apply initial skill when provided
   useEffect(() => {
-    if (initialSkill && open) {
-      if (!description.trim()) setDescription(initialSkill.prompt);
-      if (!criteria.trim()) setCriteria(initialSkill.criteria);
-      if (!model && initialSkill.model) setModel(initialSkill.model);
-    }
+    if (initialSkill && open) applySkill(initialSkill);
   }, [initialSkill, open]);
 
   const handleSkillSelect = (skillId: string) => {
     if (skillId === "none") return;
     const skill = skills.find((s) => s.id === skillId);
-    if (!skill) return;
-    if (!description.trim()) setDescription(skill.prompt);
-    if (!criteria.trim()) setCriteria(skill.criteria);
-    if (skill.model && !model) setModel(skill.model);
+    if (skill) applySkill(skill);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) return;
-
-    // Build dependsOn as JSON array string from comma-separated IDs
-    const depIds = dependsOn
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const dependsOnJson = depIds.length > 0 ? JSON.stringify(depIds) : "";
 
     // Append approval:required tag if checkbox is set
     let finalTags = tags.trim();
@@ -112,11 +112,10 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
       {
         title: title.trim(),
         description: description.trim(),
-        criteria: criteria.trim(),
         repoUrl: repoUrl.trim(),
         priority: parseInt(priority),
         tags: finalTags,
-        dependsOn: dependsOnJson,
+        dependsOn: serializeDependsOn(dependsOn),
         model: model === "default" ? "" : model,
         maxTurns: parseInt(maxTurns, 10) || 0,
         assignedRunnerId: assignedRunnerId === "any" ? null : assignedRunnerId,
@@ -130,11 +129,10 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
           toast.success("Task created");
           setTitle("");
           setDescription("");
-          setCriteria("");
           setRepoUrl("");
           setPriority("2");
           setTags("");
-          setDependsOn("");
+          setDependsOn([]);
           setModel("");
           setMaxTurns("");
           setAssignedRunnerId("any");
@@ -196,20 +194,8 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
             <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Detailed instructions for the agent..."
-              rows={3}
-            />
-          </div>
-
-          <div>
-            <label className="mb-1 block text-sm font-medium">
-              Acceptance Criteria
-            </label>
-            <Textarea
-              value={criteria}
-              onChange={(e) => setCriteria(e.target.value)}
-              placeholder="How to verify the task is complete..."
-              rows={2}
+              placeholder="Everything the agent should know: what to do, context, and how to tell it's done..."
+              className="min-h-40"
             />
           </div>
 
@@ -245,11 +231,14 @@ export function CreateTaskForm({ boardId, externalOpen, onExternalOpenChange, in
             <label className="mb-1 block text-sm font-medium">
               Depends On
             </label>
-            <Input
+            <DependsOnPicker
+              tasks={boardTasks}
               value={dependsOn}
-              onChange={(e) => setDependsOn(e.target.value)}
-              placeholder="Comma-separated task IDs"
+              onChange={setDependsOn}
             />
+            <p className="mt-1 text-xs text-muted-foreground">
+              The task waits until these are done.
+            </p>
           </div>
 
           <div>

@@ -23,6 +23,11 @@ import { LogViewer } from "../logs/LogViewer";
 import { GitDiffViewer } from "./GitDiffViewer";
 import { TaskFeedback } from "./TaskFeedback";
 import {
+  DependsOnPicker,
+  parseDependsOn,
+  serializeDependsOn,
+} from "../forms/DependsOnPicker";
+import {
   agentLabel,
   useDeleteTask,
   useStopTask,
@@ -160,7 +165,7 @@ export function TaskCardDetail({
   const stopTask = useStopTask();
   const retryTask = useRetryTask();
   const updateTask = useUpdateTask();
-  const { data: allTasks } = useTasksQuery();
+  const { data: allTasks } = useTasksQuery(task.boardId);
   const { data: queueStatus } = useDispatcherStatus();
   const canMergePrs = !!queueStatus?.canMergePrs;
   const { data: runners = [] } = useRunnersQuery(open);
@@ -396,20 +401,22 @@ export function TaskCardDetail({
             />
           </div>
 
-          {/* Criteria */}
-          <div>
-            <h4 className="mb-1 text-xs font-medium text-muted-foreground">
-              Acceptance Criteria
-            </h4>
-            <EditableText
-              value={task.criteria}
-              onSave={(v) => handleUpdate("criteria", v)}
-              disabled={!isEditable}
-              multiline
-              placeholder="Add acceptance criteria..."
-              className="whitespace-pre-wrap text-sm"
-            />
-          </div>
+          {/* Criteria: no longer asked for (it goes in the description), shown for older tasks that have it */}
+          {task.criteria && (
+            <div>
+              <h4 className="mb-1 text-xs font-medium text-muted-foreground">
+                Acceptance Criteria
+              </h4>
+              <EditableText
+                value={task.criteria}
+                onSave={(v) => handleUpdate("criteria", v)}
+                disabled={!isEditable}
+                multiline
+                placeholder="Add acceptance criteria..."
+                className="whitespace-pre-wrap text-sm"
+              />
+            </div>
+          )}
 
           {/* Repository override */}
           <div>
@@ -495,27 +502,18 @@ export function TaskCardDetail({
               Dependencies
             </h4>
             {isEditable ? (
-              <EditableText
-                value={(() => {
-                  try {
-                    const ids: string[] = task.dependsOn ? JSON.parse(task.dependsOn) : [];
-                    return ids.join(", ");
-                  } catch {
-                    return task.dependsOn;
-                  }
-                })()}
-                onSave={(v) => {
-                  const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
-                  handleUpdate("dependsOn", ids.length > 0 ? JSON.stringify(ids) : "");
-                }}
-                placeholder="Comma-separated task IDs..."
-                className="text-sm font-mono"
+              <DependsOnPicker
+                tasks={allTasks ?? []}
+                value={parseDependsOn(task.dependsOn)}
+                onChange={(ids) => handleUpdate("dependsOn", serializeDependsOn(ids))}
+                taskId={task.id}
               />
-            ) : null}
-            {(() => {
-              try {
-                const depIds: string[] = task.dependsOn ? JSON.parse(task.dependsOn) : [];
-                if (depIds.length === 0) return null;
+            ) : (
+              (() => {
+                const depIds = parseDependsOn(task.dependsOn);
+                if (depIds.length === 0) {
+                  return <span className="px-2 text-sm italic text-muted-foreground">None</span>;
+                }
                 return (
                   <div className="mt-1 space-y-1 px-2">
                     {depIds.map((id) => {
@@ -536,10 +534,8 @@ export function TaskCardDetail({
                     })}
                   </div>
                 );
-              } catch {
-                return null;
-              }
-            })()}
+              })()
+            )}
           </div>
 
           {/* Model */}
