@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const VERSION = "1.3.1";
+const VERSION = "1.4.0";
 const POLL_INTERVAL_MS = 5_000;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const LOG_FLUSH_INTERVAL_MS = 1_000;
@@ -27,6 +27,13 @@ const MAX_DIFF_CHARS = 1_000_000;
 const SUMMARY_TIMEOUT_MS = 120_000;
 // Claude Code doesn't exit after its final result while a Monitor the agent started is running
 const RESULT_EXIT_GRACE_MS = 30_000;
+// A repo can name a check (e.g. a build) in this file, which runs before its PR is opened
+const REPO_CONFIG_FILE = ".agentboard.json";
+const CHECK_TIMEOUT_MS = 20 * 60_000;
+const CHECK_FIX_ROUNDS = 2;
+const MAX_CHECK_OUTPUT = 8_000;
+// Turns for the short follow-up runs that resolve merge conflicts or fix the check
+const FIX_MAX_TURNS = 40;
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_DIR = path.join(os.homedir(), ".agentboard-runner");
 
@@ -248,6 +255,39 @@ function run(cmd, args, { cwd, timeout = 120_000, input, useShell = false } = {}
   });
 }
 
+/** Run a repo's shell command; resolves whether it passed and its output, never rejects */
+function runShellCommand(job, command, cwd, timeout) {
+  return new Promise((resolve) => {
+    const child = spawn(command, {
+      cwd,
+      env: childEnv(),
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      detached: !IS_WINDOWS,
+    });
+    job.child = child;
+    let output = "";
+    const keep = (data) => {
+      output = (output + data).slice(-MAX_CHECK_OUTPUT * 4);
+    };
+    const timer = setTimeout(() => {
+      output += `\n(stopped after ${timeout / 60_000} minutes)`;
+      killTree(child);
+    }, timeout);
+    child.stdout.on("data", keep);
+    child.stderr.on("data", keep);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, output: err.message });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0, output: output.trim() });
+    });
+  });
+}
+
 function killTree(child) {
   if (!child || !child.pid || child.exitCode !== null) return;
   if (IS_WINDOWS) {
@@ -424,23 +464,34 @@ async function openPullRequest(claim, ws) {
   return out.trim().split("\n").pop() || "";
 }
 
+/** git -c flags for commits on a machine with no git identity */
+async function identityArgs(ws) {
+  const hasIdentity = await git(["config", "user.email"], ws.dir).then((s) => !!s.trim(), () => false);
+  return hasIdentity
+    ? []
+    : ["-c", "user.name=AgentBoard Runner", "-c", "user.email=agentboard-runner@users.noreply.github.com"];
+}
+
+/** Commit whatever the agent changed. Returns whether there was anything to commit. */
+async function commitWork(ws, message) {
+  await git(["add", "-A"], ws.dir);
+  const status = (await git(["status", "--porcelain"], ws.dir)).trim();
+  if (!status) return false;
+  await git([...(await identityArgs(ws)), "commit", "-m", message], ws.dir);
+  return true;
+}
+
+async function aheadOfBase(ws) {
+  return parseInt((await git(["rev-list", "--count", `${ws.baseCommit}..HEAD`], ws.dir)).trim(), 10) > 0;
+}
+
 /**
  * Commit whatever the agent changed and push the task branch.
  * Returns the diff against the base branch, or null if there's nothing to push.
  */
 async function commitAndPush(ws, message, log) {
-  await git(["add", "-A"], ws.dir);
-  const status = (await git(["status", "--porcelain"], ws.dir)).trim();
-  if (status) {
-    const hasIdentity = await git(["config", "user.email"], ws.dir).then((s) => !!s.trim(), () => false);
-    const identity = hasIdentity
-      ? []
-      : ["-c", "user.name=AgentBoard Runner", "-c", "user.email=agentboard-runner@users.noreply.github.com"];
-    await git([...identity, "commit", "-m", message], ws.dir);
-  }
-
-  const ahead = parseInt((await git(["rev-list", "--count", `${ws.baseCommit}..HEAD`], ws.dir)).trim(), 10);
-  if (!ahead) return null;
+  await commitWork(ws, message);
+  if (!(await aheadOfBase(ws))) return null;
 
   ws.keep = true; // committed but not pushed yet: don't delete it if the push fails
   let diff = await git(["diff", `${ws.baseCommit}..HEAD`], ws.dir, 60_000).catch(() => "");
@@ -472,14 +523,176 @@ async function saveCheckpoint(claim, ws, job, log, reason) {
   return checkpoint;
 }
 
-/** Commit whatever the agent changed, push the branch and open a PR */
-async function publishChanges(claim, ws, log) {
+/** The check command a repo names in .agentboard.json ({ "check": "npm test" }), or "" */
+function repoCheck(dir, log) {
+  const file = path.join(dir, REPO_CONFIG_FILE);
+  if (!fs.existsSync(file)) return "";
+  try {
+    const check = JSON.parse(fs.readFileSync(file, "utf-8")).check;
+    return typeof check === "string" ? check.trim() : "";
+  } catch (err) {
+    log("system", `Ignoring ${REPO_CONFIG_FILE}, it isn't valid JSON (${err.message})`);
+    return "";
+  }
+}
+
+function taskBrief(claim) {
+  const text = claim.instructions.split("\n## Project Knowledge Base")[0];
+  return text.length > 4000 ? text.slice(0, 4000) + "\n..." : text;
+}
+
+function mergePrompt(claim, ws, base, files) {
+  return `You are an autonomous AI agent. Work in the current directory: ${ws.dir}, on branch ${ws.branchName}.
+The runner merged the latest ${base} into this branch so its pull request won't conflict with work that landed while this task ran. These files have merge conflicts:
+${files.map((f) => `- ${f}`).join("\n")}
+
+Resolve every conflict so that both this task's work and the new work on ${base} keep working: keep what each side meant rather than picking one side, and check that the result still fits together (names, calls, settings, docs). Remove every conflict marker.
+Do NOT commit, abort the merge, or switch branches. The runner finishes the merge.
+
+This branch's task, for context:
+${taskBrief(claim)}
+
+Before your final message, stop any monitors and background tasks you started (TaskStop).`;
+}
+
+function checkPrompt(claim, ws, output) {
+  return `You are an autonomous AI agent. Work in the current directory: ${ws.dir}, on branch ${ws.branchName}.
+Before opening this branch's pull request the runner ran the repository's check, \`${ws.check}\`, and it failed:
+
+${output}
+
+Fix what it reports, then run \`${ws.check}\` again until it passes. Keep the task's work; don't remove features to make the check pass.
+Do NOT commit, push or switch branches. The runner handles git.
+
+This branch's task, for context:
+${taskBrief(claim)}
+
+Before your final message, stop any monitors and background tasks you started (TaskStop).`;
+}
+
+async function conflictedFiles(ws) {
+  const out = await git(["diff", "--name-only", "--diff-filter=U"], ws.dir).catch(() => "");
+  return out.split("\n").map((f) => f.trim()).filter(Boolean);
+}
+
+/** The files that still have conflict markers */
+function unresolved(ws, files) {
+  return files.filter((file) => {
+    const full = path.join(ws.dir, file);
+    if (!fs.existsSync(full)) return false;
+    return /^(<{7}|>{7}) /m.test(fs.readFileSync(full, "utf-8"));
+  });
+}
+
+/**
+ * Merge the latest base branch into the task branch, so the PR doesn't conflict
+ * with work that landed while the agent ran. The agent resolves conflicts; if it
+ * can't, the merge is undone and the PR goes up as before.
+ */
+async function mergeBase(claim, ws, job, log) {
+  const base = `origin/${claim.repo.baseBranch}`;
+  try {
+    await git(["fetch", "origin", claim.repo.baseBranch], ws.dir, 5 * 60_000);
+  } catch (err) {
+    log("system", `Could not fetch ${claim.repo.baseBranch} to merge it in: ${err.message}`);
+    return EMPTY_USAGE;
+  }
+  const behind = parseInt((await git(["rev-list", "--count", `HEAD..${base}`], ws.dir)).trim(), 10);
+  if (!behind) return EMPTY_USAGE;
+
+  log("system", `Merging ${behind} new commit${behind === 1 ? "" : "s"} from ${claim.repo.baseBranch} into the branch`);
+  const identity = await identityArgs(ws);
+  let usage = EMPTY_USAGE;
+  try {
+    await git([...identity, "merge", "--no-edit", base], ws.dir, 5 * 60_000);
+  } catch (err) {
+    const files = await conflictedFiles(ws);
+    if (files.length === 0) {
+      await git(["merge", "--abort"], ws.dir).catch(() => {});
+      log("system", `Could not merge ${claim.repo.baseBranch}: ${err.message}`);
+      return EMPTY_USAGE;
+    }
+    if (job.nearLimit) {
+      await git(["merge", "--abort"], ws.dir).catch(() => {});
+      log("system", `Merge conflicts in ${files.join(", ")}, but Claude usage is nearly used up, so the merge was undone. The PR may show conflicts.`);
+      return EMPTY_USAGE;
+    }
+    log("system", `Merge conflicts in ${files.join(", ")}. Asking the agent to resolve them`);
+    const agent = await runClaude(job, mergePrompt(claim, ws, base, files), ws.dir, claim.task.model, FIX_MAX_TURNS, log);
+    usage = agent.usage;
+    if (agent.usageLimit) pauseForUsageLimit(agent.usageLimit.resetAt, agent.usageLimit.message);
+    const left = job.cancelled ? files : unresolved(ws, files);
+    if (agent.error || left.length > 0) {
+      await git(["merge", "--abort"], ws.dir).catch(() => {});
+      log(
+        "system",
+        `Undid the merge with ${claim.repo.baseBranch} (${agent.error || `conflicts left in ${left.join(", ")}`}). The PR may show conflicts.`
+      );
+      return usage;
+    }
+    await git(["add", "-A"], ws.dir);
+    const merging = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], ws.dir).then(() => true, () => false);
+    if (merging) await git([...identity, "commit", "--no-edit"], ws.dir);
+    log("system", `Resolved the conflicts with ${claim.repo.baseBranch}`);
+  }
+  // Diffs compare against the base branch, so the merged-in work doesn't show as the task's
+  ws.baseCommit = (await git(["merge-base", "HEAD", base], ws.dir)).trim();
+  return usage;
+}
+
+/**
+ * Run the repo's check, giving the agent its output to fix a few times.
+ * Returns the last failing output, or "" once it passes.
+ */
+async function runCheck(claim, ws, job, log) {
+  let usage = EMPTY_USAGE;
+  for (let round = 0; ; round++) {
+    log("system", `Running the repo's check: ${ws.check}`);
+    const result = await runShellCommand(job, ws.check, ws.dir, CHECK_TIMEOUT_MS);
+    if (job.cancelled) return { usage, failure: "" };
+    if (result.ok) {
+      log("system", "The check passed");
+      return { usage, failure: "" };
+    }
+    const output = result.output.slice(-MAX_CHECK_OUTPUT) || "(no output)";
+    log("system", `The check failed:\n${output}`);
+    if (round >= CHECK_FIX_ROUNDS) return { usage, failure: output };
+    if (job.nearLimit) {
+      log("system", "Claude usage is nearly used up, so the agent doesn't try to fix it");
+      return { usage, failure: output };
+    }
+
+    log("system", "Asking the agent to fix it");
+    const agent = await runClaude(job, checkPrompt(claim, ws, output), ws.dir, claim.task.model, FIX_MAX_TURNS, log);
+    usage = addUsage(usage, agent.usage);
+    if (agent.usageLimit) pauseForUsageLimit(agent.usageLimit.resetAt, agent.usageLimit.message);
+    if (job.cancelled) return { usage, failure: "" };
+    if (agent.error) return { usage, failure: output };
+    await commitWork(ws, `[AgentBoard] Fix the check: ${claim.task.title}`);
+  }
+}
+
+/** Commit the agent's work, merge the base branch in, run the repo's check, push and open a PR */
+async function publishChanges(claim, ws, job, log) {
   const { task, repo } = claim;
+
+  await commitWork(ws, `[AgentBoard] ${task.title}`);
+  let usage = EMPTY_USAGE;
+  let checkFailed = "";
+  if (await aheadOfBase(ws)) {
+    usage = await mergeBase(claim, ws, job, log);
+    if (ws.check && !job.cancelled) {
+      const checked = await runCheck(claim, ws, job, log);
+      usage = addUsage(usage, checked.usage);
+      checkFailed = checked.failure;
+    }
+  }
+  if (job.cancelled) return { branchName: "", prUrl: "", pushed: false, diff: "", checkFailed: "", usage };
 
   const diff = await commitAndPush(ws, `[AgentBoard] ${task.title}`, log);
   if (diff === null) {
     log("system", "No file changes to publish");
-    return { branchName: "", prUrl: "", pushed: false, diff: "" };
+    return { branchName: "", prUrl: "", pushed: false, diff: "", checkFailed: "", usage };
   }
 
   let prUrl = "";
@@ -495,7 +708,8 @@ async function publishChanges(claim, ws, log) {
     );
   }
 
-  return { branchName: ws.branchName, prUrl, pushed: true, diff };
+  if (checkFailed) log("system", "The check still fails, so the board won't merge this PR on its own");
+  return { branchName: ws.branchName, prUrl, pushed: true, diff, checkFailed, usage };
 }
 
 async function cleanupWorkspace(ws, log) {
@@ -584,6 +798,9 @@ Work in the current directory: ${ws.dir}`;
     prompt += `\nYou are working on branch: ${ws.branchName}`;
     prompt += `\nDo NOT create new branches or switch branches. Stay on the current branch.`;
     prompt += `\nDo NOT commit or push changes. The runner handles git automatically.`;
+  }
+  if (ws.check) {
+    prompt += `\nBefore it opens the pull request, the runner runs this repository's check: \`${ws.check}\`. Run it yourself before you finish and fix anything it reports.`;
   }
   prompt += `\n\n${claim.instructions}`;
   if (claim.resume) prompt += resumeInstructions(claim, ws);
@@ -1002,6 +1219,7 @@ async function runJob(claim) {
 
   try {
     ws = await prepareWorkspace(claim, log);
+    if (ws.repo) ws.check = repoCheck(ws.dir, log);
     const maxTurns = claim.maxTurns ?? config.maxTurns;
     const agent = await runClaude(job, buildPrompt(claim, ws), ws.dir, task.model, maxTurns, log);
     usage = agent.usage;
@@ -1020,9 +1238,11 @@ async function runJob(claim) {
     if (agent.nearLimit) pauseForUsageLimit(agent.nearLimit.resetAt, agent.nearLimit.message);
     log("system", `Agent finished (${usage.inputTokens.toLocaleString()} in / ${usage.outputTokens.toLocaleString()} out tokens)`);
 
-    const published = ws.repo
-      ? await publishChanges(claim, ws, log)
-      : { branchName: "", prUrl: "", pushed: false, diff: "" };
+    const { usage: publishUsage, ...published } = ws.repo
+      ? await publishChanges(claim, ws, job, log)
+      : { branchName: "", prUrl: "", pushed: false, diff: "", checkFailed: "", usage: EMPTY_USAGE };
+    usage = addUsage(usage, publishUsage);
+    if (job.cancelled) return;
     if (!ws.repo) log("system", `Output files are in ${ws.dir} on ${me.name}`);
 
     let extras = { summary: agent.resultText.slice(0, 4000), memories: [] };

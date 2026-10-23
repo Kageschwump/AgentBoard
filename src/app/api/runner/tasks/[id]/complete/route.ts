@@ -10,6 +10,8 @@ const completeSchema = z.object({
   branchName: z.string().max(250).optional().default(""),
   prUrl: z.string().max(500).optional().default(""),
   pushed: z.boolean().optional().default(false),
+  // The repo's check (.agentboard.json) still failed when the runner opened the PR
+  checkFailed: z.string().max(10_000).optional().default(""),
   diff: z.string().optional().default(""),
   summary: z.string().max(20_000).optional().default(""),
   memories: z

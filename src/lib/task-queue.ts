@@ -58,6 +58,8 @@ export interface RunResult {
   prUrl: string;
   /** Whether the runner pushed a branch with changes */
   pushed: boolean;
+  /** Output of the repo's check if it still failed when the PR was opened, else "" */
+  checkFailed?: string;
   diff: string;
   summary: string;
   memories: { key: string; value: string }[];
@@ -329,7 +331,14 @@ export async function completeRun(
       ...(result.prUrl && { prUrl: result.prUrl }),
     }).catch(() => {});
 
-  const board = result.prUrl && !needsApproval
+  if (result.checkFailed) {
+    await writeSystemLog(
+      taskId,
+      `The repo's check failed, so this PR stays in Review instead of being merged:\n${result.checkFailed}`
+    );
+  }
+
+  const board = result.prUrl && !needsApproval && !result.checkFailed
     ? await prisma.board.findUnique({ where: { id: task.boardId }, select: { autoMerge: true } })
     : null;
   if (board?.autoMerge) {
