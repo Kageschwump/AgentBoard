@@ -25,7 +25,6 @@ export async function POST(
     data: {
       status: "todo",
       error: null,
-      agentPid: null,
       retryCount: { increment: 1 },
     },
   });

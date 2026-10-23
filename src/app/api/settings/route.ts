@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { setSetting, getMaxConcurrent } from "@/lib/settings";
-import { getDispatcher } from "@/lib/dispatcher";
+import { getSetting, setSetting } from "@/lib/settings";
 import { z } from "zod/v4";
 
 const updateSettingSchema = z.object({
@@ -9,8 +8,8 @@ const updateSettingSchema = z.object({
 });
 
 export async function GET() {
-  const maxConcurrent = await getMaxConcurrent();
-  return NextResponse.json({ maxConcurrent });
+  const queuePaused = (await getSetting("queuePaused")) === "true";
+  return NextResponse.json({ queuePaused });
 }
 
 export async function PUT(request: Request) {
@@ -19,12 +18,6 @@ export async function PUT(request: Request) {
     const { key, value } = updateSettingSchema.parse(body);
 
     await setSetting(key, value);
-
-    // If maxConcurrent changed, update the running dispatcher
-    if (key === "maxConcurrent") {
-      const dispatcher = getDispatcher();
-      dispatcher.setMaxConcurrent(parseInt(value, 10));
-    }
 
     return NextResponse.json({ success: true, key, value });
   } catch (error) {

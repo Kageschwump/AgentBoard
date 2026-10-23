@@ -2,12 +2,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { emitEvent } from "@/lib/event-emitter";
 import { z } from "zod/v4";
-import {
-  mergePullRequest,
-  closePullRequest,
-  cleanupWorktree,
-  detectProvider,
-} from "@/lib/git-operations";
+import { mergeGitHubPr, closeGitHubPr } from "@/lib/github";
+import { runnerExists } from "@/lib/runner-auth";
 
 const updateTaskSchema = z.object({
   title: z.string().min(1).optional(),
@@ -29,6 +25,11 @@ const updateTaskSchema = z.object({
   scheduledFor: z.string().nullable().optional(),
   cronExpression: z.string().optional(),
   recurring: z.boolean().optional(),
+  maxTurns: z.number().int().min(0).max(1000).optional(),
+  assignedRunnerId: z.string().nullable().optional(),
+  // Only clearing is allowed: discards saved progress so the next attempt starts fresh
+  resumeBranch: z.literal("").optional(),
+  resumeNote: z.literal("").optional(),
 });
 
 export async function GET(
@@ -51,6 +52,9 @@ export async function PATCH(
   try {
     const body = await request.json();
     const { scheduledFor, ...rest } = updateTaskSchema.parse(body);
+    if (rest.assignedRunnerId && !(await runnerExists(rest.assignedRunnerId))) {
+      return NextResponse.json({ error: "That agent no longer exists" }, { status: 400 });
+    }
 
     // Fetch current task to detect status transitions
     const currentTask = await prisma.task.findUnique({ where: { id } });
@@ -58,49 +62,28 @@ export async function PATCH(
       return NextResponse.json({ error: "Task not found" }, { status: 404 });
     }
 
-    // Handle approval transition: review → done (merge PR)
+    // Handle approval transition: review → done (merge PR if this server can)
     if (currentTask.status === "review" && rest.status === "done" && currentTask.prUrl) {
-      const board = await prisma.board.findUnique({
-        where: { id: currentTask.boardId },
-        select: { repoPath: true, gitProvider: true },
-      });
-      if (board?.repoPath) {
-        try {
-          const provider = detectProvider(board.repoPath, board.gitProvider || undefined);
-          mergePullRequest(currentTask.prUrl, board.repoPath, provider);
-          // Clean up worktree after successful merge
-          if (currentTask.worktreePath) {
-            cleanupWorktree(board.repoPath, currentTask.worktreePath, currentTask.branchName || undefined);
-          }
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : "Merge failed";
-          return NextResponse.json(
-            { error: `PR merge failed: ${errMsg}. Resolve conflicts on GitHub first.` },
-            { status: 409 }
-          );
-        }
+      try {
+        await mergeGitHubPr(currentTask.prUrl, currentTask.branchName);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : "Merge failed";
+        return NextResponse.json(
+          { error: `PR merge failed: ${errMsg}. Resolve it on GitHub first.` },
+          { status: 409 }
+        );
       }
     }
 
-    // Handle rejection transition: review → failed (close PR)
-    if (currentTask.status === "review" && rest.status === "failed" && currentTask.prUrl) {
-      const board = await prisma.board.findUnique({
-        where: { id: currentTask.boardId },
-        select: { repoPath: true, gitProvider: true },
-      });
-      if (board?.repoPath) {
-        const provider = detectProvider(board.repoPath, board.gitProvider || undefined);
+    // Handle rejection transition: review → failed (close PR, start fresh next time)
+    if (currentTask.status === "review" && rest.status === "failed") {
+      rest.resumeBranch = "";
+      rest.resumeNote = "";
+      if (currentTask.prUrl) {
         try {
-          closePullRequest(currentTask.prUrl, board.repoPath, provider);
+          await closeGitHubPr(currentTask.prUrl, currentTask.branchName);
         } catch {
           // Best-effort: PR close failure shouldn't block rejection
-        }
-        if (currentTask.worktreePath) {
-          try {
-            cleanupWorktree(board.repoPath, currentTask.worktreePath, currentTask.branchName || undefined);
-          } catch {
-            // Best-effort cleanup
-          }
         }
       }
     }

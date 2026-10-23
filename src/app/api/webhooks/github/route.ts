@@ -16,7 +16,8 @@
  *   - Only acts on "opened" action (new issues/PRs)
  *   - Maps issue.title -> task.title
  *   - Maps issue.body -> task.description
- *   - Maps issue.html_url -> task.repoUrl
+ *   - Appends issue.html_url to the description
+ *   - Maps repository.clone_url -> task.repoUrl (the repo runners check out)
  *   - Tags: "issue" or "pr" based on event type
  */
 
@@ -66,11 +67,14 @@ export async function POST(request: Request) {
       where: { status: "todo" },
     });
 
+    const repository = body.repository as { clone_url?: string } | undefined;
     const task = await prisma.task.create({
       data: {
         title: issue.title,
-        description: issue.body || "",
-        repoUrl: issue.html_url || "",
+        description: [issue.body, issue.html_url && `Source: ${issue.html_url}`]
+          .filter(Boolean)
+          .join("\n\n"),
+        repoUrl: repository?.clone_url || "",
         boardId: "default",
         tags: body.pull_request ? "pr" : "issue",
         position: (maxPos._max.position ?? 0) + 1,

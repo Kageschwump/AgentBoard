@@ -1,0 +1,23 @@
+# Fly.io config. See README → "Hosting on Fly.io".
+# Change `app` to a unique name (see README).
+app = "agentboard-kasper"
+primary_region = "ams"
+
+[build]
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  # The board holds live connections (SSE) and runs the scheduler, so keep one machine up
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+# SQLite lives on this volume. Run exactly one machine.
+[[mounts]]
+  source = "agentboard_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

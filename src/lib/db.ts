@@ -6,14 +6,18 @@ const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
 };
 
+/** Resolve DATABASE_URL ("file:./prisma/dev.db", "file:/data/agentboard.db") to a file path */
+function resolveDbPath() {
+  const url = process.env.DATABASE_URL || "file:./prisma/dev.db";
+  return path.resolve(process.cwd(), url.replace(/^file:/, ""));
+}
+
 function createPrismaClient() {
-  const dbPath = path.join(process.cwd(), "prisma", "dev.db");
-  const adapter = new PrismaBetterSqlite3({ url: dbPath });
+  const adapter = new PrismaBetterSqlite3({ url: resolveDbPath() });
   return new PrismaClient({ adapter });
 }
 
+// Always cache on globalThis: instrumentation and route handlers are separate
+// bundles in production and must share one client.
 export const prisma = globalForPrisma.prisma ?? createPrismaClient();
-
-if (process.env.NODE_ENV !== "production") {
-  globalForPrisma.prisma = prisma;
-}
+globalForPrisma.prisma = prisma;

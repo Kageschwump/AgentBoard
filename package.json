@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "db:push": "prisma db push",
+    "runner": "node runner/agentboard-runner.mjs"
   },
   "dependencies": {
     "@hello-pangea/dnd": "^18.0.1",

@@ -1,7 +1,7 @@
 import { prisma } from "./db";
 
 const DEFAULTS: Record<string, string> = {
-  maxConcurrent: "2",
+  queuePaused: "false",
 };
 
 export async function getSetting(key: string): Promise<string> {
@@ -17,8 +17,7 @@ export async function setSetting(key: string, value: string): Promise<void> {
   });
 }
 
-export async function getMaxConcurrent(): Promise<number> {
-  const val = await getSetting("maxConcurrent");
-  const num = parseInt(val, 10);
-  return isNaN(num) || num < 1 ? 2 : Math.min(num, 10);
+/** When paused, runners are not handed new tasks (running tasks continue) */
+export async function isQueuePaused(): Promise<boolean> {
+  return (await getSetting("queuePaused")) === "true";
 }
