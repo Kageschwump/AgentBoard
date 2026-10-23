@@ -81,19 +81,31 @@ export function runnerLabel(runner: Pick<Runner, "name" | "owner">): string {
   return runner.owner ? `${runner.name} (${runner.owner})` : runner.name;
 }
 
-async function dependenciesDone(task: Task): Promise<boolean> {
-  if (!task.dependsOn) return true;
+function dependencyIds(task: Task): string[] {
+  if (!task.dependsOn) return [];
   try {
-    const depIds: string[] = JSON.parse(task.dependsOn);
-    if (depIds.length === 0) return true;
-    const deps = await prisma.task.findMany({
-      where: { id: { in: depIds } },
-      select: { id: true, status: true },
-    });
-    return depIds.every((id) => deps.find((d) => d.id === id)?.status === "done");
+    const ids = JSON.parse(task.dependsOn);
+    return Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : [];
   } catch {
-    return true; // Invalid JSON in dependsOn, treat as no dependencies
+    return []; // Invalid JSON in dependsOn, treat as no dependencies
   }
+}
+
+/** The tasks whose dependencies are all done, in their original order */
+async function withDependenciesDone(tasks: Task[]): Promise<Task[]> {
+  const depIds = new Map(tasks.map((task) => [task.id, dependencyIds(task)]));
+  const allIds = [...new Set([...depIds.values()].flat())];
+  const done = new Set(
+    allIds.length === 0
+      ? []
+      : (
+          await prisma.task.findMany({
+            where: { id: { in: allIds }, status: "done" },
+            select: { id: true },
+          })
+        ).map((dep) => dep.id)
+  );
+  return tasks.filter((task) => depIds.get(task.id)!.every((id) => done.has(id)));
 }
 
 async function buildInstructions(task: Task): Promise<string> {
@@ -143,6 +155,8 @@ export async function claimTask(
 ): Promise<ClaimPayload | null> {
   if (await isQueuePaused()) return null;
 
+  // Every ready task, not just the first few: a long blocked chain can sit ahead
+  // of a task that's free to run
   const candidates = await prisma.task.findMany({
     where: {
       status: "ready",
@@ -150,12 +164,9 @@ export async function claimTask(
       OR: [{ assignedRunnerId: null }, { assignedRunnerId: runner.id }],
     },
     orderBy: [{ priority: "asc" }, { createdAt: "asc" }],
-    take: 25,
   });
 
-  for (const task of candidates) {
-    if (!(await dependenciesDone(task))) continue;
-
+  for (const task of await withDependenciesDone(candidates)) {
     const runId = crypto.randomUUID();
     const now = new Date();
     const { count } = await prisma.task.updateMany({
