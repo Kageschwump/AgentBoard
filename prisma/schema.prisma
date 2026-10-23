@@ -99,6 +99,7 @@ model Board {
   baseBranch  String   @default("main") // base branch for PRs
   gitProvider String   @default("") // "" = auto-detect, "github", "azuredevops"
   maxTurns    Int      @default(0) // default agent turn limit for tasks; 0 = the runner's default
+  autoMerge   Boolean  @default(false) // merge a task's PR as soon as the agent finishes, skipping Review
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 

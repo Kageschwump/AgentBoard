@@ -75,7 +75,7 @@ To reach a home machine from outside, put it behind HTTPS with something like [C
 |---|---|---|
 | `AGENTBOARD_PASSWORD` | yes (in production) | Shared password for the web UI. A production server refuses to serve anything without it. Changing it logs everyone out. |
 | `DATABASE_URL` | no | SQLite location. Defaults to `file:./prisma/dev.db`; the Docker image uses `file:/data/agentboard.db`. |
-| `GITHUB_TOKEN` | no | Lets **Approve & Merge** merge PRs from the board (fine-grained token with *Pull requests* and *Contents* read/write). Without it, approving marks the task done and you merge on GitHub. |
+| `GITHUB_TOKEN` | no | Lets **Approve & Merge** merge PRs from the board, and boards with *Merge PRs automatically* merge them as soon as the agent finishes (fine-grained token with *Pull requests* and *Contents* read/write). Without it, approving marks the task done and you merge on GitHub. |
 | `WEBHOOK_SECRET` | no | Lets `/api/webhooks` accept requests carrying a matching `X-Webhook-Secret` header without logging in. |
 
 ## Connecting an agent

@@ -9,6 +9,7 @@ const updateBoardSchema = z.object({
   baseBranch: z.string().optional(),
   gitProvider: z.string().optional(),
   maxTurns: z.number().int().min(0).max(1000).optional(),
+  autoMerge: z.boolean().optional(),
 });
 
 export async function GET(

@@ -70,6 +70,7 @@ export function useUpdateBoard() {
       baseBranch?: string;
       gitProvider?: string;
       maxTurns?: number;
+      autoMerge?: boolean;
     }) => {
       const res = await fetch(`/api/boards/${id}`, {
         method: "PATCH",

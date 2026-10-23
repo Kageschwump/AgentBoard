@@ -21,6 +21,7 @@ import {
   useCreateBoard,
   useUpdateBoard,
   useDeleteBoard,
+  useDispatcherStatus,
 } from "@/hooks/useTasksQuery";
 import { toast } from "sonner";
 
@@ -34,6 +35,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
   const createBoard = useCreateBoard();
   const updateBoard = useUpdateBoard();
   const deleteBoard = useDeleteBoard();
+  const { data: queueStatus } = useDispatcherStatus();
   const [createOpen, setCreateOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newName, setNewName] = useState("");
@@ -44,6 +46,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
   const [editBaseBranch, setEditBaseBranch] = useState("main");
   const [editGitProvider, setEditGitProvider] = useState("");
   const [editMaxTurns, setEditMaxTurns] = useState("");
+  const [editAutoMerge, setEditAutoMerge] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
   const currentBoard = boards.find((b) => b.id === boardId);
@@ -80,6 +83,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
       setEditBaseBranch(currentBoard.baseBranch || "main");
       setEditGitProvider(currentBoard.gitProvider || "");
       setEditMaxTurns(currentBoard.maxTurns ? String(currentBoard.maxTurns) : "");
+      setEditAutoMerge(currentBoard.autoMerge);
     }
     setSettingsOpen(true);
   };
@@ -93,6 +97,7 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
         baseBranch: editBaseBranch.trim() || "main",
         gitProvider: editGitProvider,
         maxTurns: Math.min(1000, Math.max(0, parseInt(editMaxTurns, 10) || 0)),
+        autoMerge: editAutoMerge,
       },
       {
         onSuccess: () => {
@@ -312,6 +317,30 @@ export function BoardSelector({ boardId, onBoardChange }: BoardSelectorProps) {
                 How many steps an agent gets before it stops and saves its progress for the next
                 attempt. Tasks can override this.
               </p>
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="auto-merge"
+                  checked={editAutoMerge}
+                  onChange={(e) => setEditAutoMerge(e.target.checked)}
+                  className="h-4 w-4 rounded border-border"
+                />
+                <label htmlFor="auto-merge" className="text-sm font-medium">
+                  Merge PRs automatically
+                </label>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                A task&apos;s PR is merged as soon as its agent finishes, without waiting in Review,
+                so tasks that depend on it can start. Tasks marked Require Approval still wait. If a
+                merge fails (e.g. a conflict), the task stays in Review.
+              </p>
+              {editAutoMerge && queueStatus && !queueStatus.canMergePrs && (
+                <p className="mt-1 text-xs text-destructive">
+                  This server has no GITHUB_TOKEN, so it can&apos;t merge PRs yet.
+                </p>
+              )}
             </div>
             <div className="flex justify-end gap-2">
               <Button

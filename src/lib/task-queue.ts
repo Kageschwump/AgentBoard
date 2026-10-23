@@ -3,6 +3,7 @@ import { prisma } from "./db";
 import { emitEvent } from "./event-emitter";
 import { isQueuePaused } from "./settings";
 import { fireIntegrations } from "./integration-dispatcher";
+import { canMergeOnGitHub, mergeGitHubPr } from "./github";
 import type { Runner, Task } from "@/generated/prisma/client";
 
 /**
@@ -262,7 +263,7 @@ export async function completeRun(
     .split(",")
     .map((t) => t.trim())
     .includes("approval:required");
-  // Pushed work always gets a human look before it counts as done
+  // Pushed work gets a human look before it counts as done, unless the board auto-merges (below)
   const finalStatus = needsApproval || result.prUrl || result.pushed ? "review" : "done";
 
   const { count } = await prisma.task.updateMany({
@@ -306,16 +307,60 @@ export async function completeRun(
 
   emitEvent({ type: "task:updated", taskId });
   emitEvent({ type: "runners:updated" });
-  fireIntegrations(`task:${finalStatus}`, {
-    id: task.id,
-    title: task.title,
-    status: finalStatus,
-    boardId: task.boardId,
-    runner: task.runnerName,
-    ...(result.prUrl && { prUrl: result.prUrl }),
-  }).catch(() => {});
+
+  const notify = (status: string) =>
+    fireIntegrations(`task:${status}`, {
+      id: task.id,
+      title: task.title,
+      status,
+      boardId: task.boardId,
+      runner: task.runnerName,
+      ...(result.prUrl && { prUrl: result.prUrl }),
+    }).catch(() => {});
+
+  const board = result.prUrl && !needsApproval
+    ? await prisma.board.findUnique({ where: { id: task.boardId }, select: { autoMerge: true } })
+    : null;
+  if (board?.autoMerge) {
+    // Not awaited: the GitHub calls can outlast the runner's request timeout
+    autoMerge(taskId, result.prUrl, result.branchName)
+      .then((merged) => notify(merged ? "done" : "review"))
+      .catch(() => {});
+  } else {
+    notify(finalStatus);
+  }
 
   return true;
+}
+
+/**
+ * Merge a finished task's PR on a board that skips review, and mark it Done.
+ * When that can't happen the task stays in Review, with a log line saying why.
+ */
+async function autoMerge(taskId: string, prUrl: string, branchName: string): Promise<boolean> {
+  let reason = "";
+  try {
+    if (!(await mergeGitHubPr(prUrl, branchName))) {
+      reason = canMergeOnGitHub()
+        ? "the board can only merge GitHub PRs"
+        : "GITHUB_TOKEN isn't set on the board's server";
+    }
+  } catch (err) {
+    reason = err instanceof Error ? err.message : "merge failed";
+  }
+  if (reason) {
+    await writeSystemLog(taskId, `Auto-merge didn't go through (${reason}). Left in Review.`);
+    return false;
+  }
+
+  // Someone may have moved the task while GitHub was merging
+  const { count } = await prisma.task.updateMany({
+    where: { id: taskId, status: "review" },
+    data: { status: "done" },
+  });
+  await writeSystemLog(taskId, "PR merged automatically (the board has auto-merge on)");
+  emitEvent({ type: "task:updated", taskId });
+  return count > 0;
 }
 
 export interface RunFailure {

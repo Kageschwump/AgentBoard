@@ -10,6 +10,7 @@ const createBoardSchema = z.object({
   baseBranch: z.string().optional().default("main"),
   gitProvider: z.string().optional().default(""),
   maxTurns: z.number().int().min(0).max(1000).optional().default(0),
+  autoMerge: z.boolean().optional().default(false),
 });
 
 export async function GET() {
